@@ -101,3 +101,5 @@ hosting — user PDFs never touch Vercel's servers.
 
 Note: pdf.js rendering uses `intent: 'print'` so thumbnails keep rendering
 when the tab is hidden or backgrounded — don't remove that flag.
+
+Made By Aubin
