@@ -26,6 +26,26 @@ Common conventions: drop a file (or click to browse), adjust, then the red
 action button downloads a **new copy** — originals are never modified.
 Password-protected PDFs are rejected with a clear message.
 
+## Conversion desk
+
+A second catalogue adds 41 local conversion routes across Photoshop, PDF,
+image, document, text, CSV and JSON files. Notable routes include:
+
+Reciprocal routes are presented once as a two-way choice (for example,
+JPG ↔ PNG) and can be reversed with the swap control on the conversion desk.
+
+- PSD → Word: flattened artwork plus document details and a layer inventory
+- PSD → Excel: document facts and structured layer data
+- PSD → PDF / PNG / JPG / WebP
+- PDF → PNG / JPG / TXT / Word / Excel
+- JPG / PNG / WebP / GIF / BMP / SVG → image or PDF formats
+- Word / HTML / TXT → readable document and text formats
+- CSV / JSON → Excel, structured data and printable PDF
+
+Conversions run in the browser and download a new copy. The two PSD office
+routes preserve useful visual or structural information; they do not turn
+Photoshop layers into editable Word or Excel artwork.
+
 ## Stack
 
 - [React 19](https://react.dev) + [Vite](https://vite.dev)

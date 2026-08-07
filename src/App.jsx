@@ -12,6 +12,7 @@ import Darkroom from './components/Darkroom.jsx'
 import Typesetter from './components/Typesetter.jsx'
 import Scribe from './components/Scribe.jsx'
 import Ledger from './components/Ledger.jsx'
+import ConversionDesk from './components/ConversionDesk.jsx'
 
 const TOOL_COMPONENTS = {
   separator: Separator,
@@ -31,6 +32,7 @@ const TOOL_COMPONENTS = {
 export default function App() {
   const [view, setView] = useState('home')
   const ActiveTool = TOOL_COMPONENTS[view]
+  const conversionId = view.startsWith('convert:') ? view.slice('convert:'.length) : null
 
   return (
     <div className="app">
@@ -56,7 +58,13 @@ export default function App() {
       </header>
 
       <main className="page">
-        {ActiveTool ? (
+        {conversionId ? (
+          <ConversionDesk
+            key={view}
+            initialConversion={conversionId}
+            onBack={() => setView('home')}
+          />
+        ) : ActiveTool ? (
           <ActiveTool key={view} onBack={() => setView('home')} />
         ) : (
           <Home onOpenTool={(id) => setView(id)} />
