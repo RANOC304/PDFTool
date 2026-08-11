@@ -3,6 +3,7 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  base: '/',
   assetsInclude: ['**/*.wasm'],
   server: {
     // Respect an assigned port (e.g. from the preview harness); fall back to Vite's default
@@ -12,6 +13,10 @@ export default defineConfig({
     port: Number(process.env.PORT) || 4173,
   },
   build: {
+    outDir: 'dist',
+    // Keep production assets away from the old /assets namespace. A previous
+    // catch-all Vercel rewrite could cache index.html at missing asset URLs.
+    assetsDir: 'static',
     rollupOptions: {
       output: {
         // Split the heavy PDF libraries into their own long-cacheable chunks

@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "audit:conversions": "node scripts/auditConversions.mjs",
-    "audit:fidelity": "node scripts/generateFidelityPdf.mjs && node scripts/auditFidelity.mjs"
+    "audit:fidelity": "node scripts/generateFidelityPdf.mjs && node scripts/auditFidelity.mjs",
+    "audit:deployment": "node scripts/auditDeployment.mjs"
   },
   "dependencies": {
     "@imagemagick/magick-wasm": "^0.0.41",

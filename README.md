@@ -105,9 +105,9 @@ npm run audit:fidelity     # exercise document, data, PDF and image fixtures
 ## Deploying to Vercel
 
 The project is a static Vite site — no server, no environment variables,
-no database. [vercel.json](vercel.json) provides the SPA rewrite plus
-caching and security headers; Vercel auto-detects the Vite framework
-(`npm run build` → `dist/`).
+no database. [vercel.json](vercel.json) explicitly publishes the Vite
+`dist/` directory and provides security headers. The interface does not use
+URL-based client routing, so asset requests are never rewritten to HTML.
 
 **Via GitHub (recommended):** push this repo to GitHub, then
 [import it on Vercel](https://vercel.com/new) — every push to `main`
