@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="420" viewBox="0 0 720 420">
+  <defs>
+    <linearGradient id="paper" x1="0" x2="1"><stop stop-color="#1c1710"/><stop offset="1" stop-color="#8b2f22"/></linearGradient>
+  </defs>
+  <rect width="720" height="420" rx="36" fill="url(#paper)"/>
+  <path d="M80 310 C190 160 300 360 430 180 S610 140 650 90" fill="none" stroke="#d4a13b" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="110" cy="105" r="42" fill="#d4a13b"/>
+  <text x="180" y="120" fill="#fff" font-family="Arial" font-size="50" font-weight="700">Native vector PDF</text>
+  <text x="80" y="370" fill="#fff" font-family="Arial" font-size="24">Paths stay vector and this text stays selectable.</text>
+</svg>

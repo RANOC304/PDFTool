@@ -1,0 +1,7 @@
+Massicot fidelity fixture
+
+    indentation is authentic
+	this tab becomes four visible spaces
+        nested indentation remains nested
+
+unbroken_identifier_that_is_deliberately_long_enough_to_wrap_without_losing_any_character_or_collapsing_the_leading_layout_information_0123456789

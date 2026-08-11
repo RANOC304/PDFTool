@@ -1,0 +1,5 @@
+name,name,active,score,notes
+Alpha,Primary,true,42,"Comma, quote ""and"" unicode café"
+Beta,Secondary,false,0,"A deliberately long value that wraps across the measured cell without being shortened, clipped, or replaced by an ellipsis in the generated PDF document."
+,,false,17,
+Gamma,Third,true,99,"Final row"

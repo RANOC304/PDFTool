@@ -2,6 +2,7 @@ import * as pdfjsLib from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { PDFDocument, StandardFonts, rgb, degrees } from 'pdf-lib'
 import { zipSync } from 'fflate'
+import { planPdfRasterPage } from './rasterPolicy.js'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl
 
@@ -230,23 +231,54 @@ export async function imagesToPdf(images, { pageMode = 'fit' } = {}) {
 
 /* ————— Darkroom (PDF -> images) ————— */
 
-export async function pdfToImages(doc, { format = 'png', scale = 2, onProgress } = {}) {
-  const mime = format === 'jpeg' ? 'image/jpeg' : 'image/png'
+export async function pdfToImages(
+  doc,
+  {
+    format = 'png', scale = 2, dpi = null, maxPixels = 32_000_000,
+    maxTotalPixels = Number.POSITIVE_INFINITY, quality = null, onProgress,
+  } = {},
+) {
+  const mime = format === 'jpeg' ? 'image/jpeg' : format === 'webp' ? 'image/webp' : 'image/png'
   const files = []
+  let renderedPixels = 0
   for (let n = 1; n <= doc.numPages; n++) {
     onProgress?.(n, doc.numPages)
     const page = await doc.getPage(n)
-    const viewport = page.getViewport({ scale })
+    const base = page.getViewport({ scale: 1 })
+    const rasterPlan = planPdfRasterPage({
+      width: base.width, height: base.height, scale, dpi, maxPixels, maxTotalPixels,
+      renderedPixels, pageNumber: n,
+    })
+    const viewport = page.getViewport({ scale: rasterPlan.scale })
+    renderedPixels += rasterPlan.pixels
     const canvas = document.createElement('canvas')
     canvas.width = Math.ceil(viewport.width)
     canvas.height = Math.ceil(viewport.height)
-    await page.render({ canvasContext: canvas.getContext('2d'), viewport, intent: 'print' }).promise
-    const blob = await new Promise((r) => canvas.toBlob(r, mime, 0.9))
+    const context = canvas.getContext('2d', { alpha: false })
+    context.fillStyle = '#ffffff'
+    context.fillRect(0, 0, canvas.width, canvas.height)
+    await page.render({
+      canvasContext: context,
+      viewport,
+      intent: 'print',
+      annotationMode: pdfjsLib.AnnotationMode?.ENABLE_STORAGE,
+      annotationCanvasMap: new Map(),
+    }).promise
+    const encoderQuality = quality ?? (format === 'jpeg' ? 0.99 : format === 'webp' ? 1 : undefined)
+    const blob = await new Promise((r) => canvas.toBlob(r, mime, encoderQuality))
+    if (!blob) throw new Error(`The browser could not encode page ${n} as ${format}.`)
     canvas.width = 0
     canvas.height = 0
     files.push({
-      name: `page-${String(n).padStart(2, '0')}.${format === 'jpeg' ? 'jpg' : 'png'}`,
+      name: `page-${String(n).padStart(2, '0')}.${format === 'jpeg' ? 'jpg' : format}`,
       bytes: new Uint8Array(await blob.arrayBuffer()),
+      mime,
+      width: Math.ceil(viewport.width),
+      height: Math.ceil(viewport.height),
+      pageWidth: base.width,
+      pageHeight: base.height,
+      scale: rasterPlan.scale,
+      dpi: rasterPlan.dpi,
     })
   }
   return files
@@ -289,12 +321,42 @@ export async function extractText(doc) {
   for (let n = 1; n <= doc.numPages; n++) {
     const page = await doc.getPage(n)
     const content = await page.getTextContent()
-    let text = ''
-    for (const item of content.items) {
-      text += item.str
-      if (item.hasEOL) text += '\n'
+    const lines = []
+    let line = ''
+    let lineY = null
+    let lastEnd = null
+
+    const flush = () => {
+      lines.push(line.trimEnd())
+      line = ''
+      lineY = null
+      lastEnd = null
     }
-    pages.push(text.trim())
+
+    for (const item of content.items) {
+      if (typeof item.str !== 'string') continue
+      const x = item.transform?.[4] ?? 0
+      const y = item.transform?.[5] ?? 0
+      const height = Math.max(1, Math.abs(item.height || item.transform?.[3] || 10))
+      const avgCharWidth = item.str.length ? Math.max(1, item.width / item.str.length) : height * 0.45
+      const changedLine = lineY !== null && Math.abs(y - lineY) > Math.max(1.5, height * 0.45)
+      const movedBack = lastEnd !== null && x < lastEnd - avgCharWidth
+      if (line && (changedLine || movedBack)) flush()
+
+      if (lineY === null) lineY = y
+      if (line && lastEnd !== null) {
+        const gap = x - lastEnd
+        if (gap > avgCharWidth * 0.35) {
+          const spaces = Math.min(12, Math.max(1, Math.round(gap / avgCharWidth)))
+          line += ' '.repeat(spaces)
+        }
+      }
+      line += item.str
+      lastEnd = x + (item.width || 0)
+      if (item.hasEOL) flush()
+    }
+    if (line || !lines.length) flush()
+    pages.push(lines.join('\n').replace(/\n{3,}/g, '\n\n').trim())
   }
   return pages
 }
@@ -339,7 +401,10 @@ export function zipFiles(files) {
 }
 
 export function downloadBytes(bytes, filename, mime = 'application/pdf') {
-  const blob = new Blob([bytes], { type: mime })
+  return downloadBlob(new Blob([bytes], { type: mime }), filename)
+}
+
+export function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url

@@ -6,15 +6,20 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "audit:conversions": "node scripts/auditConversions.mjs",
+    "audit:fidelity": "node scripts/generateFidelityPdf.mjs && node scripts/auditFidelity.mjs"
   },
   "dependencies": {
+    "@imagemagick/magick-wasm": "^0.0.41",
     "ag-psd": "^31.0.2",
     "docx": "^9.7.1",
     "fflate": "^0.8.3",
-    "mammoth": "^1.12.0",
+    "mime-db": "^1.54.0",
+    "pandoc-wasm": "^1.1.0",
     "pdf-lib": "^1.17.1",
-    "pdfjs-dist": "^5.3.31",
+    "pdfjs-dist": "^6.2.108",
+    "pdfmake": "^0.3.11",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Massicot HTML fidelity fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f4eee2; color: #1c1710; font: 18px/1.55 Georgia, serif; }
+    header { padding: 72px 8vw; color: white; background: linear-gradient(120deg, #1c1710, #8b2f22); }
+    h1 { max-width: 12ch; margin: 0; font-size: 64px; line-height: .96; }
+    main { max-width: 980px; margin: 0 auto; padding: 56px 40px; }
+    .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .card { min-height: 180px; padding: 24px; border: 2px solid #1c1710; background: white; box-shadow: 7px 7px 0 #d4a13b; }
+    table { width: 100%; margin-top: 40px; border-collapse: collapse; background: white; }
+    th, td { padding: 14px; border: 1px solid #9a9184; text-align: left; }
+    th { color: white; background: #8b2f22; }
+  </style>
+</head>
+<body>
+  <header><p>Fidelity proof · 2026</p><h1>Design should survive conversion.</h1></header>
+  <main>
+    <section class="cards">
+      <article class="card"><h2>Layout</h2><p>Grid geometry and spacing stay visible.</p></article>
+      <article class="card"><h2>Theme</h2><p>Colour, borders and shadows remain authentic.</p></article>
+      <article class="card"><h2>Type</h2><p><strong>Emphasis</strong> and hierarchy still read correctly.</p></article>
+    </section>
+    <table><thead><tr><th>Dimension</th><th>Expected</th></tr></thead><tbody><tr><td>Content</td><td>Complete</td></tr><tr><td>Visuals</td><td>Page-faithful</td></tr></tbody></table>
+  </main>
+</body>
+</html>

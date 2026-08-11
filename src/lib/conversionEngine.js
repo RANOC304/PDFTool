@@ -1,6 +1,10 @@
-import { PDFDocument } from 'pdf-lib'
-import { strToU8, zipSync } from 'fflate'
+import { bytesToBase64, packageOriginalFile } from './binaryEngine.js'
+import { csvCell, csvRowsToRecords, jsonRows, parseCsv } from './dataEngine.js'
+import { semanticPdfPagesToDocx, semanticPdfPagesToXlsx, structuredRowsToXlsx } from './officeEngine.js'
+import { nativeHtmlDocumentToPdf, nativeSvgToPdf, nativeTableToPdf, nativeTextToPdf } from './nativePdfWriter.js'
+import { pdfToSemanticPages } from './pdfSemanticEngine.js'
 import { extractText, imagesToPdf, openPdf, pdfToImages, zipFiles } from './pdfEngine.js'
+import { assertPsdFidelityLimits, flattenPsdLayers } from './psdPolicy.js'
 
 const MIME = {
   csv: 'text/csv;charset=utf-8',
@@ -18,6 +22,18 @@ const MIME = {
 
 const encoder = new TextEncoder()
 
+function externalCssResource(css) {
+  for (const match of String(css || '').matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi)) {
+    const value = match[2].trim()
+    if (value && !value.startsWith('data:') && !value.startsWith('#')) return value
+  }
+  for (const match of String(css || '').matchAll(/@import\s+(?:url\(\s*)?['"]?([^'"\s);]+)/gi)) {
+    const value = match[1].trim()
+    if (value && !value.startsWith('data:')) return value
+  }
+  return null
+}
+
 function stem(name) {
   return name.replace(/\.[^.]+$/, '')
 }
@@ -31,6 +47,7 @@ function output(bytes, file, target, extension = target, mime = MIME[target]) {
 }
 
 function validateFile(file, conversion) {
+  if (conversion.source === 'any') return
   const accepted = conversion.accept
     .split(',')
     .map((value) => value.trim().toLowerCase())
@@ -65,7 +82,11 @@ function canvasWithBackground(source, background = null) {
 }
 
 async function imageFileToCanvas(file) {
-  const url = URL.createObjectURL(file)
+  let renderSource = file
+  if (/\.svg$/i.test(file.name) || file.type === 'image/svg+xml') {
+    renderSource = new Blob([await sanitizeSvg(file)], { type: 'image/svg+xml' })
+  }
+  const url = URL.createObjectURL(renderSource)
   try {
     const image = await new Promise((resolve, reject) => {
       const element = new Image()
@@ -75,11 +96,15 @@ async function imageFileToCanvas(file) {
     })
     const sourceWidth = image.naturalWidth || image.width || 1600
     const sourceHeight = image.naturalHeight || image.height || 900
-    const maxPixels = 40_000_000
-    const scale = Math.min(1, Math.sqrt(maxPixels / (sourceWidth * sourceHeight)))
+    const maxPixels = 64_000_000
+    if (sourceWidth * sourceHeight > maxPixels) {
+      throw new Error(
+        'This image exceeds the 64-megapixel safe browser limit. It was not resized or changed.',
+      )
+    }
     const canvas = document.createElement('canvas')
-    canvas.width = Math.max(1, Math.round(sourceWidth * scale))
-    canvas.height = Math.max(1, Math.round(sourceHeight * scale))
+    canvas.width = sourceWidth
+    canvas.height = sourceHeight
     canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height)
     return canvas
   } finally {
@@ -87,11 +112,39 @@ async function imageFileToCanvas(file) {
   }
 }
 
+async function sanitizeSvg(file) {
+  const source = new DOMParser().parseFromString(await file.text(), 'image/svg+xml')
+  if (source.querySelector('parsererror')) throw new Error('This SVG is not valid XML.')
+  const dynamic = source.querySelector('script, foreignObject, animate, animateMotion, animateTransform, set')
+  if (dynamic) {
+    throw new Error(`This SVG contains <${dynamic.tagName}> content that cannot remain authentic in a static PDF or raster image. Export a static SVG first.`)
+  }
+  source.querySelectorAll('*').forEach((node) => {
+    for (const attribute of [...node.attributes]) {
+      if (/^on/i.test(attribute.name)) node.removeAttribute(attribute.name)
+    }
+  })
+  for (const node of source.querySelectorAll('image, use, feImage, [src], link[rel~="stylesheet"]')) {
+    const value = node.getAttribute('href') || node.getAttribute('xlink:href') || node.getAttribute('src')
+    if (value && !value.startsWith('data:') && !value.startsWith('#')) {
+      throw new Error(
+        `The SVG references an external resource (${value.slice(0, 90)}). Embed it as a data URI so the artwork cannot render incomplete.`,
+      )
+    }
+  }
+  const css = [...source.querySelectorAll('style')].map((node) => node.textContent || '').join('\n')
+  const externalUrl = externalCssResource(css)
+  if (externalUrl) {
+    throw new Error(`The SVG stylesheet references an external resource (${externalUrl.slice(0, 90)}). Embed it before converting.`)
+  }
+  return new XMLSerializer().serializeToString(source)
+}
+
 async function rasterBytes(canvas, target) {
   const mime = MIME[target]
   const needsWhite = target === 'jpg'
   const working = needsWhite ? canvasWithBackground(canvas, '#ffffff') : canvas
-  const blob = await canvasBlob(working, mime, target === 'png' ? undefined : 0.9)
+  const blob = await canvasBlob(working, mime, target === 'png' ? undefined : 0.96)
   if (working !== canvas) {
     working.width = 0
     working.height = 0
@@ -104,23 +157,25 @@ async function canvasToPdf(canvas) {
   return imagesToPdf([{ name: 'artwork.png', type: 'image/png', bytes: png }])
 }
 
-function flattenLayers(layers = [], depth = 0, rows = []) {
-  for (const layer of layers) {
-    rows.push({
-      depth,
-      name: layer.name || 'Untitled layer',
-      type: layer.children?.length ? 'Group' : layer.text ? 'Text' : 'Layer',
-      visible: layer.hidden ? 'No' : 'Yes',
-      opacity: Math.round((layer.opacity ?? 1) * 100),
-      blendMode: layer.blendMode || 'normal',
-      bounds: [layer.left, layer.top, layer.right, layer.bottom].every(Number.isFinite)
-        ? `${layer.left}, ${layer.top} → ${layer.right}, ${layer.bottom}`
-        : '',
-      text: layer.text?.text || '',
-    })
-    if (layer.children?.length) flattenLayers(layer.children, depth + 1, rows)
-  }
-  return rows
+async function encodePngWithMagick(png, target) {
+  const source = new Blob([png], { type: 'image/png' })
+  Object.defineProperty(source, 'name', { value: 'rendered-artwork.png' })
+  const { convertWithImageMagick } = await import('./magickEngine.js')
+  const result = await convertWithImageMagick(source, {
+    engineSource: 'PNG',
+    engineFormat: target === 'jpg' ? 'JPEG' : 'WEBP',
+    targetExtension: target,
+    targetLabel: target.toUpperCase(),
+    targetMime: MIME[target],
+  })
+  return result.bytes
+}
+
+async function encodeCanvas(canvas, target) {
+  if (target === 'pdf') return canvasToPdf(canvas)
+  if (target === 'png') return rasterBytes(canvas, 'png')
+  const png = await rasterBytes(canvas, 'png')
+  return encodePngWithMagick(png, target)
 }
 
 async function readPsdFile(file, { composite = false } = {}) {
@@ -134,13 +189,8 @@ async function readPsdFile(file, { composite = false } = {}) {
     totalMemoryLimit: 512 * 1024 * 1024,
   }
   const structure = readPsd(buffer, { ...common, skipCompositeImageData: true })
-  const layers = flattenLayers(structure.children)
-  if (structure.width > 12_000 || structure.height > 12_000 || structure.width * structure.height > 64_000_000) {
-    throw new Error('This PSD is too large for safe in-browser conversion (maximum 64 megapixels).')
-  }
-  if (layers.length > 1_200) {
-    throw new Error('This PSD has more than 1,200 layers, which is too large for safe in-browser conversion.')
-  }
+  const layers = flattenPsdLayers(structure.children)
+  assertPsdFidelityLimits(structure, layers)
   if (!composite) return { psd: structure, layers }
 
   const psd = readPsd(buffer, common)
@@ -157,48 +207,7 @@ function xmlEscape(value) {
     .replaceAll("'", '&apos;')
 }
 
-function columnName(index) {
-  let result = ''
-  for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) {
-    result = String.fromCharCode(65 + ((n - 1) % 26)) + result
-  }
-  return result
-}
-
-function workbookBytes(rows, { sheetName = 'Conversion', headerRows = [0] } = {}) {
-  const headerSet = new Set(headerRows)
-  const widths = []
-  for (const row of rows) {
-    row.forEach((value, index) => {
-      widths[index] = Math.min(55, Math.max(widths[index] || 10, String(value ?? '').length + 2))
-    })
-  }
-  const cols = widths.map((width, index) => `<col min="${index + 1}" max="${index + 1}" width="${width}" customWidth="1"/>`).join('')
-  const body = rows
-    .map((row, rowIndex) => {
-      const cells = row
-        .map((value, columnIndex) => {
-          const ref = `${columnName(columnIndex)}${rowIndex + 1}`
-          const safe = xmlEscape(String(value ?? '').slice(0, 32767))
-          return `<c r="${ref}" t="inlineStr" s="${headerSet.has(rowIndex) ? 1 : 0}"><is><t xml:space="preserve">${safe}</t></is></c>`
-        })
-        .join('')
-      return `<row r="${rowIndex + 1}">${cells}</row>`
-    })
-    .join('')
-
-  const files = {
-    '[Content_Types].xml': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`,
-    '_rels/.rels': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
-    'xl/workbook.xml': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${xmlEscape(sheetName.slice(0, 31))}" sheetId="1" r:id="rId1"/></sheets></workbook>`,
-    'xl/_rels/workbook.xml.rels': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
-    'xl/styles.xml': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Aptos"/></font><font><b/><color rgb="FFFFFFFF"/><sz val="11"/><name val="Aptos"/></font></fonts><fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE2442B"/><bgColor indexed="64"/></patternFill></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`,
-    'xl/worksheets/sheet1.xml': `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols>${cols}</cols><sheetData>${body}</sheetData></worksheet>`,
-  }
-  return zipSync(Object.fromEntries(Object.entries(files).map(([name, value]) => [name, strToU8(value)])), { level: 6 })
-}
-
-async function wordBytes({ title, paragraphs = [], image = null, imageSize = null, table = null }) {
+async function wordBytes({ title, paragraphs = [], image = null, imageSize = null, table = null, monospace = false }) {
   const {
     Document,
     HeadingLevel,
@@ -217,7 +226,14 @@ async function wordBytes({ title, paragraphs = [], image = null, imageSize = nul
     if (paragraph.heading) {
       children.push(new Paragraph({ text: paragraph.text, heading: HeadingLevel.HEADING_1 }))
     } else {
-      children.push(new Paragraph({ children: [new TextRun(paragraph.text || '')] }))
+      children.push(new Paragraph({
+        spacing: monospace ? { before: 0, after: 0, line: 276 } : undefined,
+        children: [new TextRun({
+          text: paragraph.text || '',
+          font: monospace ? 'Aptos Mono' : 'Aptos',
+          size: monospace ? 20 : 22,
+        })],
+      }))
     }
   }
   if (image) {
@@ -238,12 +254,22 @@ async function wordBytes({ title, paragraphs = [], image = null, imageSize = nul
       new Table({
         width: { size: 100, type: WidthType.PERCENTAGE },
         rows: table.map(
-          (row) =>
+          (row, rowIndex) =>
             new TableRow({
               children: row.map(
                 (cell) =>
                   new TableCell({
-                    children: [new Paragraph({ children: [new TextRun(String(cell ?? ''))] })],
+                    shading: rowIndex === 0 ? { fill: '8B2F22', color: 'auto' } : undefined,
+                    margins: { top: 90, right: 100, bottom: 90, left: 100 },
+                    children: [new Paragraph({
+                      children: [new TextRun({
+                        text: String(cell ?? ''),
+                        bold: rowIndex === 0,
+                        color: rowIndex === 0 ? 'FFFFFF' : '1C1710',
+                        font: 'Aptos',
+                        size: 18,
+                      })],
+                    })],
                   }),
               ),
             }),
@@ -251,73 +277,16 @@ async function wordBytes({ title, paragraphs = [], image = null, imageSize = nul
       }),
     )
   }
-  const document = new Document({ sections: [{ properties: {}, children }] })
+  const document = new Document({
+    title,
+    creator: 'Massicot',
+    sections: [{
+      properties: { page: { margin: { top: 900, right: 900, bottom: 900, left: 900 } } },
+      children,
+    }],
+  })
   const blob = await Packer.toBlob(document)
   return new Uint8Array(await blob.arrayBuffer())
-}
-
-function parseCsv(text) {
-  const rows = []
-  let row = []
-  let cell = ''
-  let quoted = false
-  for (let index = 0; index < text.length; index++) {
-    const char = text[index]
-    if (quoted) {
-      if (char === '"' && text[index + 1] === '"') {
-        cell += '"'
-        index++
-      } else if (char === '"') {
-        quoted = false
-      } else {
-        cell += char
-      }
-    } else if (char === '"') {
-      quoted = true
-    } else if (char === ',') {
-      row.push(cell)
-      cell = ''
-    } else if (char === '\n') {
-      row.push(cell.replace(/\r$/, ''))
-      rows.push(row)
-      row = []
-      cell = ''
-    } else {
-      cell += char
-    }
-  }
-  if (cell || row.length) {
-    row.push(cell.replace(/\r$/, ''))
-    rows.push(row)
-  }
-  return rows
-}
-
-function csvCell(value) {
-  const text = typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value ?? '')
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
-}
-
-function jsonRows(value) {
-  if (Array.isArray(value)) {
-    if (!value.length) return [['Value']]
-    if (value.every((item) => item && typeof item === 'object' && !Array.isArray(item))) {
-      const headers = [...new Set(value.flatMap((item) => Object.keys(item)))]
-      return [headers, ...value.map((item) => headers.map((header) => item[header] ?? ''))]
-    }
-    return [['Value'], ...value.map((item) => [item])]
-  }
-  if (value && typeof value === 'object') {
-    return [['Key', 'Value'], ...Object.entries(value)]
-  }
-  return [['Value'], [value]]
-}
-
-function csvRowsToRecords(rows) {
-  const [headers = [], ...body] = rows
-  return body
-    .filter((row) => row.some((cell) => cell !== ''))
-    .map((row) => Object.fromEntries(headers.map((header, index) => [header || `column_${index + 1}`, row[index] ?? ''])))
 }
 
 function htmlToText(html) {
@@ -327,77 +296,98 @@ function htmlToText(html) {
 }
 
 function textToHtml(text, title) {
-  return `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>${xmlEscape(title)}</title>\n<style>body{max-width:760px;margin:48px auto;padding:0 24px;font:17px/1.65 system-ui,sans-serif;color:#1c1710}pre{white-space:pre-wrap;font:inherit}</style>\n</head>\n<body><pre>${xmlEscape(text)}</pre></body>\n</html>`
+  return `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width,initial-scale=1">\n<title>${xmlEscape(title)}</title>\n<style>:root{color-scheme:light}*{box-sizing:border-box}html{background:#f3eee4;color:#1c1710}body{max-width:1040px;margin:48px auto;padding:0 24px;font:16px/1.6 system-ui,sans-serif}header{padding:20px 24px;color:#fff;background:#1c1710;border-bottom:4px solid #c7432f}h1{overflow-wrap:anywhere;margin:0;font-size:18px}pre{overflow:auto;margin:0;padding:28px 24px;border:1px solid #d7cfc0;border-top:0;background:#fffdf8;white-space:pre-wrap;overflow-wrap:anywhere;tab-size:4;font:14px/1.65 "Aptos Mono","Cascadia Mono",Consolas,monospace}@media(max-width:700px){body{margin:0;padding:0}header,pre{border-left:0;border-right:0}}</style>\n</head>\n<body><header><h1>${xmlEscape(title)}</h1></header><main><pre>${xmlEscape(text)}</pre></main></body>\n</html>`
 }
 
-function wrapCanvasLine(context, text, maxWidth) {
-  if (!text) return ['']
-  const words = text.split(/\s+/)
-  const lines = []
-  let line = ''
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word
-    if (context.measureText(candidate).width <= maxWidth || !line) {
-      line = candidate
-    } else {
-      lines.push(line)
-      line = word
+function sanitizeHtmlForRendering(raw) {
+  const documentNode = new DOMParser().parseFromString(raw, 'text/html')
+  const unsupported = documentNode.querySelector('script, iframe, frame, object, embed, canvas')
+  if (unsupported) {
+    throw new Error(
+      `This HTML contains <${unsupported.tagName.toLowerCase()}> content that cannot be reproduced safely as static page artwork. Export a self-contained static HTML copy first; nothing was silently removed.`,
+    )
+  }
+  documentNode.querySelectorAll('meta[http-equiv="refresh"]').forEach((node) => node.remove())
+  documentNode.querySelectorAll('*').forEach((node) => {
+    for (const attribute of [...node.attributes]) {
+      if (/^on/i.test(attribute.name)) node.removeAttribute(attribute.name)
+    }
+  })
+
+  const resourceAttributes = [
+    ['[src]', 'src'], ['[poster]', 'poster'], ['link[rel~="stylesheet"][href]', 'href'],
+    ['image[href], use[href], feImage[href]', 'href'],
+    ['image[xlink\\:href], use[xlink\\:href], feImage[xlink\\:href]', 'xlink:href'],
+  ]
+  for (const [selector, attribute] of resourceAttributes) {
+    for (const node of documentNode.querySelectorAll(selector)) {
+      const value = node.getAttribute(attribute)?.trim()
+      if (value && !value.startsWith('data:')) {
+        throw new Error(
+          `The HTML references an external resource (${value.slice(0, 90)}). Embed images, fonts and stylesheets as data URIs so the PDF cannot silently lose them.`,
+        )
+      }
     }
   }
-  if (line) lines.push(line)
-  return lines
+  if (documentNode.querySelector('[srcset]')) {
+    throw new Error('This HTML uses srcset, whose selected resource can vary by device. Replace it with one embedded data-URI src before converting.')
+  }
+  for (const css of [...documentNode.querySelectorAll('style')].map((node) => node.textContent || '')
+    .concat([...documentNode.querySelectorAll('[style]')].map((node) => node.getAttribute('style') || ''))) {
+    const externalUrl = externalCssResource(css)
+    if (externalUrl) {
+      throw new Error(
+        `The HTML stylesheet references an external resource (${externalUrl.slice(0, 90)}). Embed it before converting so the visual theme stays complete.`,
+      )
+    }
+  }
+  return '<!doctype html>\n' + documentNode.documentElement.outerHTML
 }
 
-async function textToPdf(text, title) {
-  const pageWidth = 1240
-  const pageHeight = 1754
-  const padding = 92
-  const lineHeight = 38
-  const canvas = document.createElement('canvas')
-  canvas.width = pageWidth
-  canvas.height = pageHeight
-  const context = canvas.getContext('2d')
-  context.font = '26px "Segoe UI", Arial, sans-serif'
-  const lines = String(text || '')
-    .replaceAll('\t', '    ')
-    .split(/\r?\n/)
-    .flatMap((line) => wrapCanvasLine(context, line, pageWidth - padding * 2))
-  if (!lines.length) lines.push('')
+async function htmlToNativePdf(raw, title) {
+  const cleanHtml = sanitizeHtmlForRendering(raw)
+  const iframe = document.createElement('iframe')
+  iframe.setAttribute('sandbox', 'allow-same-origin')
+  iframe.setAttribute('aria-hidden', 'true')
+  Object.assign(iframe.style, {
+    position: 'fixed', left: '-20000px', top: '0', width: '1200px', height: '800px',
+    border: '0', zIndex: '-2147483648', pointerEvents: 'none',
+  })
+  document.body.appendChild(iframe)
 
-  const maxLines = Math.floor((pageHeight - padding * 2 - 58) / lineHeight)
-  const pdf = await PDFDocument.create()
-  for (let offset = 0; offset < lines.length; offset += maxLines) {
-    context.fillStyle = '#ffffff'
-    context.fillRect(0, 0, pageWidth, pageHeight)
-    context.fillStyle = '#1c1710'
-    context.font = '600 22px "Segoe UI", Arial, sans-serif'
-    context.fillText(title, padding, 58)
-    context.font = '26px "Segoe UI", Arial, sans-serif'
-    lines.slice(offset, offset + maxLines).forEach((line, index) => {
-      context.fillText(line, padding, padding + 44 + index * lineHeight)
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('The HTML document took too long to prepare.')), 12_000)
+      iframe.onload = () => {
+        clearTimeout(timeout)
+        resolve()
+      }
+      iframe.srcdoc = cleanHtml
     })
-    const png = await canvasBlob(canvas, 'image/png')
-    const embedded = await pdf.embedPng(await png.arrayBuffer())
-    const page = pdf.addPage([595.28, 841.89])
-    page.drawImage(embedded, { x: 0, y: 0, width: 595.28, height: 841.89 })
+    const frameDocument = iframe.contentDocument
+    if (!frameDocument?.body) throw new Error('The browser could not create a safe rendering document.')
+    await frameDocument.fonts?.ready
+    const images = [...frameDocument.images]
+    await Promise.all(images.map((image) => image.complete
+      ? (image.naturalWidth > 0
+          ? Promise.resolve()
+          : Promise.reject(new Error(`The embedded image “${image.alt || 'untitled'}” could not be rendered.`)))
+      : new Promise((resolve, reject) => {
+          image.addEventListener('load', resolve, { once: true })
+          image.addEventListener('error', () => reject(new Error(`The embedded image “${image.alt || 'untitled'}” could not be rendered.`)), { once: true })
+        })))
+
+    return nativeHtmlDocumentToPdf(frameDocument, title)
+  } finally {
+    iframe.remove()
   }
-  canvas.width = 0
-  canvas.height = 0
-  return pdf.save()
 }
 
 async function convertPsd(file, target) {
   if (target === 'xlsx') {
-    const { psd, layers } = await readPsdFile(file)
+    const { psd, layers } = await readPsdFile(file, { composite: false })
     const rows = [
-      ['PSD document', file.name],
-      ['Width', `${psd.width} px`],
-      ['Height', `${psd.height} px`],
-      ['Colour mode', String(psd.colorMode ?? '')],
-      ['Bits per channel', String(psd.bitsPerChannel ?? '')],
-      ['Layer count', String(layers.length)],
-      [],
-      ['No.', 'Layer name', 'Type', 'Visible', 'Opacity', 'Blend mode', 'Bounds', 'Text'],
+      ['No.', 'Layer name', 'Type', 'Visible', 'Opacity', 'Blend mode', 'Bounds', 'Text', 'Document size', 'Bits/channel', 'Colour mode'],
       ...layers.map((layer, index) => [
         index + 1,
         `${'  '.repeat(layer.depth)}${layer.name}`,
@@ -407,9 +397,13 @@ async function convertPsd(file, target) {
         layer.blendMode,
         layer.bounds,
         layer.text,
+        `${psd.width} × ${psd.height} px`,
+        psd.bitsPerChannel ?? '',
+        psd.colorMode ?? '',
       ]),
     ]
-    return output(workbookBytes(rows, { sheetName: 'PSD layers', headerRows: [0, 7] }), file, target)
+    const bytes = structuredRowsToXlsx(rows, { sheetName: 'PSD layer inventory' })
+    return output(bytes, file, target)
   }
 
   const { psd, layers } = await readPsdFile(file, { composite: true })
@@ -422,8 +416,8 @@ async function convertPsd(file, target) {
       { text: 'Flattened artwork', heading: true },
     ]
     const table = [
-      ['No.', 'Layer', 'Type', 'Visible', 'Opacity'],
-      ...layers.map((layer, index) => [index + 1, `${'› '.repeat(layer.depth)}${layer.name}`, layer.type, layer.visible, `${layer.opacity}%`]),
+      ['No.', 'Layer', 'Type', 'Visible', 'Opacity', 'Editable text'],
+      ...layers.map((layer, index) => [index + 1, `${'› '.repeat(layer.depth)}${layer.name}`, layer.type, layer.visible, `${layer.opacity}%`, layer.text]),
     ]
     const bytes = await wordBytes({
       title: stem(file.name),
@@ -436,7 +430,7 @@ async function convertPsd(file, target) {
     canvas.height = 0
     return output(bytes, file, target)
   }
-  const bytes = target === 'pdf' ? await canvasToPdf(canvas) : await rasterBytes(canvas, target)
+  const bytes = await encodeCanvas(canvas, target)
   canvas.width = 0
   canvas.height = 0
   return output(bytes, file, target)
@@ -445,37 +439,43 @@ async function convertPsd(file, target) {
 async function convertPdf(file, target) {
   const { doc } = await openPdf(file)
   try {
-    if (target === 'png' || target === 'jpg') {
-      const files = await pdfToImages(doc, { format: target === 'jpg' ? 'jpeg' : 'png', scale: 2 })
+    if (target === 'png' || target === 'jpg' || target === 'webp') {
+      const files = await pdfToImages(doc, {
+        format: 'png', dpi: 300, maxPixels: 32_000_000, maxTotalPixels: 480_000_000,
+      })
+      if (target !== 'png') {
+        for (const page of files) {
+          page.bytes = await encodePngWithMagick(page.bytes, target)
+          page.name = page.name.replace(/\.png$/i, `.${target}`)
+        }
+      }
       if (files.length === 1) return output(files[0].bytes, file, target)
       return output(zipFiles(files), file, target, 'zip', MIME.zip)
     }
     const pages = await extractText(doc)
     if (target === 'txt') return output(encoder.encode(pages.map((page, index) => `— Page ${index + 1} —\n${page}`).join('\n\n')), file, target)
+    const pdfMetadata = await doc.getMetadata()
+      .then(({ info = {} }) => ({
+        title: info.Title || '', author: info.Author || '', subject: info.Subject || '',
+        keywords: info.Keywords || '', creator: info.Creator || '',
+      }))
+      .catch(() => ({}))
+    const semanticPages = await pdfToSemanticPages(doc, {
+      includeGraphics: target === 'docx',
+      sampleBackgrounds: target === 'xlsx',
+      graphicsDpi: 180,
+    })
     if (target === 'xlsx') {
-      const rows = [['Page', 'Extracted text'], ...pages.map((page, index) => [index + 1, page])]
-      return output(workbookBytes(rows, { sheetName: 'PDF text' }), file, target)
+      return output(semanticPdfPagesToXlsx({
+        title: stem(file.name), pages: semanticPages, metadata: pdfMetadata,
+      }), file, target)
     }
-    const paragraphs = pages.flatMap((page, index) => [
-      { text: `Page ${index + 1}`, heading: true },
-      ...page.split(/\r?\n/).map((text) => ({ text })),
-    ])
-    return output(await wordBytes({ title: stem(file.name), paragraphs }), file, target)
+    return output(await semanticPdfPagesToDocx({
+      title: stem(file.name), pages: semanticPages, metadata: pdfMetadata,
+    }), file, target)
   } finally {
     doc.destroy?.()
   }
-}
-
-async function convertDocx(file, target) {
-  const mammoth = await import('mammoth/mammoth.browser.js')
-  const arrayBuffer = await file.arrayBuffer()
-  if (target === 'html') {
-    const { value } = await mammoth.convertToHtml({ arrayBuffer })
-    const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${xmlEscape(stem(file.name))}</title></head><body>${value}</body></html>`
-    return output(encoder.encode(html), file, target)
-  }
-  const { value } = await mammoth.extractRawText({ arrayBuffer })
-  return output(encoder.encode(value), file, target)
 }
 
 async function convertTextual(file, source, target) {
@@ -483,9 +483,12 @@ async function convertTextual(file, source, target) {
   const text = source === 'html' ? htmlToText(raw) : raw
   if (target === 'txt') return output(encoder.encode(text), file, target)
   if (target === 'html') return output(encoder.encode(textToHtml(text, stem(file.name))), file, target)
-  if (target === 'pdf') return output(await textToPdf(text, stem(file.name)), file, target)
+  if (source === 'html' && target === 'pdf') {
+    return output(await htmlToNativePdf(raw, stem(file.name)), file, target)
+  }
+  if (target === 'pdf') return output(await nativeTextToPdf(text, stem(file.name)), file, target)
   const paragraphs = text.split(/\r?\n/).map((line) => ({ text: line }))
-  return output(await wordBytes({ title: stem(file.name), paragraphs }), file, target)
+  return output(await wordBytes({ title: stem(file.name), paragraphs, monospace: source !== 'html' }), file, target)
 }
 
 async function convertData(file, source, target) {
@@ -504,26 +507,58 @@ async function convertData(file, source, target) {
     rows = jsonRows(value)
   }
 
-  if (target === 'xlsx') return output(workbookBytes(rows, { sheetName: source === 'csv' ? 'CSV data' : 'JSON data' }), file, target)
+  if (target === 'xlsx') return output(structuredRowsToXlsx(rows, { sheetName: source === 'csv' ? 'CSV data' : 'JSON data' }), file, target)
   if (target === 'json') return output(encoder.encode(JSON.stringify(value, null, 2)), file, target)
   if (target === 'csv') return output(encoder.encode(rows.map((row) => row.map(csvCell).join(',')).join('\r\n')), file, target)
-  const transcript = rows.map((row) => row.map((cell) => String(cell ?? '')).join('  |  ')).join('\n')
-  return output(await textToPdf(transcript, stem(file.name)), file, target)
+  return output(await nativeTableToPdf(rows, stem(file.name)), file, target)
 }
 
 async function convertImage(file, target) {
+  if (target === 'pdf' && (/\.svg$/i.test(file.name) || file.type === 'image/svg+xml')) {
+    return output(await nativeSvgToPdf(await sanitizeSvg(file), stem(file.name)), file, target)
+  }
   const canvas = await imageFileToCanvas(file)
-  const bytes = target === 'pdf' ? await canvasToPdf(canvas) : await rasterBytes(canvas, target)
+  const bytes = await encodeCanvas(canvas, target)
   canvas.width = 0
   canvas.height = 0
   return output(bytes, file, target)
 }
 
+async function convertUniversal(file, conversion) {
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  if (conversion.target === 'zip') {
+    return output(packageOriginalFile(file.name, bytes), file, 'zip')
+  }
+
+  const encoded = bytesToBase64(bytes)
+  if (conversion.target === 'base64') {
+    return output(encoder.encode(encoded), file, 'txt', 'base64.txt', MIME.txt)
+  }
+  const mime = file.type || conversion.sourceMime || 'application/octet-stream'
+  const dataUri = `data:${mime};base64,${encoded}`
+  return output(encoder.encode(dataUri), file, 'txt', 'data-uri.txt', MIME.txt)
+}
+
 export async function convertFile(file, conversion) {
   validateFile(file, conversion)
+  if (conversion.availability === 'ready' && conversion.qualityGate?.status !== 'passed') {
+    throw new Error('This route has not passed its format-fidelity activation gate.')
+  }
+  if (conversion.availability !== 'ready') {
+    throw new Error(`${conversion.engineLabel || 'The required conversion engine'} is not connected yet.`)
+  }
+  if (conversion.handler === 'universal') return convertUniversal(file, conversion)
+  if (conversion.handler === 'textual') return convertTextual(file, conversion.source, conversion.target)
+  if (conversion.handler === 'imagemagick') {
+    const { convertWithImageMagick } = await import('./magickEngine.js')
+    return convertWithImageMagick(file, conversion)
+  }
+  if (conversion.handler === 'pandoc') {
+    const { convertWithPandoc } = await import('./pandocEngine.js')
+    return convertWithPandoc(file, conversion)
+  }
   if (conversion.source === 'psd') return convertPsd(file, conversion.target)
   if (conversion.source === 'pdf') return convertPdf(file, conversion.target)
-  if (conversion.source === 'docx') return convertDocx(file, conversion.target)
   if (conversion.source === 'txt' || conversion.source === 'html') {
     return convertTextual(file, conversion.source, conversion.target)
   }
