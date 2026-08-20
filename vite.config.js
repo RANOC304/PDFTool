@@ -8,9 +8,17 @@ export default defineConfig({
   server: {
     // Respect an assigned port (e.g. from the preview harness); fall back to Vite's default
     port: Number(process.env.PORT) || 5173,
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
   },
   preview: {
     port: Number(process.env.PORT) || 4173,
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
   },
   build: {
     outDir: 'dist',

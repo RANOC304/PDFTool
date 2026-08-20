@@ -64,15 +64,32 @@ editable Word or Excel artwork.
 Each route also carries a nine-part preservation contract for content, layout,
 theme, structure, media, metadata, colour, animation and resolution. Runnable
 routes must pass their engine-specific quality gate; unconnected specialist
-engines remain locked behind a pending activation gate. PDF-to-Word and
-PDF-to-Word reconstructs positioned native text, tables and links while keeping
-only genuine non-text artwork as imagery. PDF-to-Excel reconstructs editable
-cells on one worksheet per page with source geometry, typography and colour.
-Scan-only pages are refused until OCR is available. HTML-to-PDF produces native
-selectable text, headings, links, lists and tables, and refuses complex layouts
-instead of disguising page screenshots as document content. SVG-to-PDF keeps
-the source as vector artwork. Lossy image targets use explicit maximum-quality
-encoder policies.
+engines remain locked behind a pending activation gate.
+
+DOCX → PDF uses LibreOffice Writer compiled to WebAssembly in browsers that
+support isolated WebAssembly threads. Writer performs the pagination and native
+PDF export, so mixed page sizes, headers, footers, notes, tables, drawings,
+searchable text, vectors, links and metadata remain part of the PDF model. The
+large office runtime is downloaded on first use and then reused; document bytes
+stay in the browser. Embedded webviews that disable thread isolation use the
+audited 288-DPI page renderer with a searchable text layer instead.
+
+PDF → DOCX reconstructs positioned native text, links and detected tables while
+keeping only genuine non-text artwork as imagery. Designed pages use editable
+DrawingML text boxes at source coordinates; normal prose stays in reflowable
+Word paragraphs, and detected tables remain editable cells. Vector-only artwork
+is retained, mixed page geometry is preserved, and scan-only pages are refused
+until OCR is available. Because PDF stores painted page geometry rather than the
+original Word editing semantics, no converter can recover information that is
+absent from the PDF; the route preserves what can be proved instead of silently
+inventing structure.
+
+PDF-to-Excel reconstructs editable cells on one worksheet per page with source
+geometry, typography and colour. HTML-to-PDF produces native selectable text,
+headings, links, lists and tables, and refuses complex layouts instead of
+disguising page screenshots as document content. SVG-to-PDF keeps the source as
+vector artwork. Lossy image targets use explicit maximum-quality encoder
+policies.
 
 The browser-ready compatibility engines are ImageMagick WASM for raster/image
 coders and Pandoc WASM for documents, markup and publishing formats. The graph
@@ -90,6 +107,8 @@ engine-required until an equivalent local runtime is bundled.
 - [ImageMagick WASM](https://github.com/dlemstra/magick-wasm) — local image decoding and encoding
 - [Pandoc WASM](https://github.com/pandoc/pandoc-wasm) — local document and markup conversion
 - [pdfmake](https://pdfmake.github.io/docs/) — native selectable text, table, HTML-flow and SVG PDF writing
+- [ZetaJS](https://github.com/allotropia/zetajs) + LibreOffice WASM — local Writer-native DOCX → PDF export
+- [docx-renderer](https://github.com/recon-vcs/docx-renderer) — isolated-webview DOCX page-render fallback
 
 ## Development
 
@@ -120,8 +139,9 @@ git push -u origin main
 
 **Via CLI:** `npm i -g vercel && vercel --prod` from the project root.
 
-Because every tool runs client-side, the deployment is pure static
-hosting — user PDFs never touch Vercel's servers.
+Because every tool runs client-side, the deployment is pure static hosting —
+user documents never touch Vercel's servers. The configured COOP/COEP response
+headers are required for LibreOffice's WebAssembly threads; do not remove them.
 
 ## Architecture
 

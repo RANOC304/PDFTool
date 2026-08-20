@@ -151,6 +151,8 @@ function pageFlowBlocks(page) {
     return {
       ...bounds,
       items,
+      segments: (line.segments || []).filter((segment) =>
+        segment.items.some((item) => !page.tableItemIds.has(item.id) && item.text.trim())),
       role: line.role,
       fontSize: Math.max(...items.map((item) => item.fontSize)),
       continues: Boolean(lastVisible?.hasEOL),
@@ -167,7 +169,16 @@ function pageFlowBlocks(page) {
     const lineStep = previous ? line.top - previous.top : Infinity
     const continuationLimit = Math.max(previous?.fontSize || 0, line.fontSize) * 1.58
     const bodySized = Math.max(previous?.fontSize || 0, line.fontSize) <= bodyFontSize * 1.18
-    if (previous?.continues && bodySized && !line.startsNewBlock && lineStep > 0 && lineStep <= continuationLimit) {
+    const previousVisible = previous?.items.filter((item) => item.text.trim()) || []
+    const previousMarker = previousVisible[0]?.text.trim() || ''
+    const previousIsList = /^(?:[\u2022\u25cf\u25a0\u25e6*-]|\d+[.)])$/.test(previousMarker)
+    const continuationX = previousIsList && previousVisible[1] ? previousVisible[1].x : previous?.x
+    const horizontalTolerance = Math.max(8, Math.max(previous?.fontSize || 0, line.fontSize) * 1.25)
+    const previousCenter = previous ? previous.x + previous.width / 2 : 0
+    const lineCenter = line.x + line.width / 2
+    const horizontallyCompatible = Math.abs(line.x - continuationX) <= horizontalTolerance ||
+      Math.abs(lineCenter - previousCenter) <= horizontalTolerance
+    if (previous?.continues && bodySized && horizontallyCompatible && !line.startsNewBlock && lineStep > 0 && lineStep <= continuationLimit) {
       block.lines.push(line)
       block.x = Math.min(block.x, line.x)
       block.top = Math.min(block.top, line.top)
@@ -189,6 +200,90 @@ function pageFlowBlocks(page) {
   return blocks
 }
 
+function positionedPageBlocks(page) {
+  const bodyFontSize = pageBodyFontSize(page)
+  const lines = page.lines.flatMap((line) => {
+    const sourceSegments = line.segments?.length ? line.segments : [line]
+    return sourceSegments.map((segment) => {
+      const items = visibleLineItems(segment, page.tableItemIds)
+      if (!items.some((item) => item.text.trim())) return null
+      const bounds = lineBounds(items)
+      const lastVisible = [...items].reverse().find((item) => item.text.trim())
+      return {
+        ...bounds,
+        items,
+        role: segment.role || line.role,
+        fontSize: Math.max(...items.map((item) => item.fontSize)),
+        continues: Boolean(lastVisible?.hasEOL),
+      }
+    })
+  }).filter(Boolean).sort((a, b) => a.top - b.top || a.x - b.x)
+
+  const blocks = []
+  for (const line of lines) {
+    const candidate = [...blocks].reverse().find((block) => {
+      const previous = block.lines.at(-1)
+      const lineStep = line.top - previous.top
+      const continuationLimit = Math.max(previous.fontSize, line.fontSize) * 1.65
+      const xTolerance = Math.max(8, Math.min(previous.width, line.width) * 0.08)
+      const similarSize = Math.max(previous.fontSize, line.fontSize) <= Math.min(previous.fontSize, line.fontSize) * 1.18
+      return previous.continues && similarSize && lineStep > 0 && lineStep <= continuationLimit &&
+        Math.abs(line.x - previous.x) <= xTolerance
+    })
+    if (!candidate) {
+      blocks.push({ ...line, lines: [line] })
+      continue
+    }
+    candidate.lines.push(line)
+    candidate.x = Math.min(candidate.x, line.x)
+    candidate.top = Math.min(candidate.top, line.top)
+    candidate.right = Math.max(candidate.right, line.right)
+    candidate.bottom = Math.max(candidate.bottom, line.bottom)
+    candidate.width = candidate.right - candidate.x
+    candidate.height = candidate.bottom - candidate.top
+    candidate.fontSize = Math.max(candidate.fontSize, line.fontSize)
+  }
+
+  for (const block of blocks) {
+    const steps = block.lines.slice(1).map((line, index) => line.top - block.lines[index].top)
+    block.linePitch = Math.max(block.fontSize * 1.08, median(steps) || block.height + 1)
+    block.text = block.lines.map((line) => line.items.map((item) => item.text).join('')).join(' ')
+    block.bodyFontSize = bodyFontSize
+  }
+  return blocks
+}
+
+function pageIsTableOfContents(page) {
+  const pageText = page.lines.map((line) => line.text || line.items.map((item) => item.text).join('')).join('\n')
+  return /table\s+of\s+contents?/i.test(pageText) ||
+    page.lines.filter((line) => /\.{4,}/.test(line.text || '') && /\d\s*$/.test(line.text || '')).length >= 3
+}
+
+function pageUsesPositionedLayout(page) {
+  if (pageIsTableOfContents(page)) return false
+
+  const wideSeparatedLines = page.lines.filter((line) => {
+    const segments = (line.segments || []).filter((segment) =>
+      segment.items.some((item) => !page.tableItemIds.has(item.id) && item.text.trim()))
+    return segments.some((segment, index) => index > 0 &&
+      segment.x - (segments[index - 1].x + segments[index - 1].width) > 36)
+  }).length
+  const artwork = page.graphics
+  const artworkArea = artwork?.bounds ? artwork.bounds.width * artwork.bounds.height : 0
+  const denseArtwork = artworkArea >= page.width * page.height * 0.2 && (artwork?.coverage || 0) >= 0.35
+  const textOverArtwork = denseArtwork && page.items.filter((item) => {
+    if (page.tableItemIds.has(item.id) || !item.text.trim()) return false
+    const centerX = item.x + item.width / 2
+    const centerY = item.top + item.height / 2
+    return centerX >= artwork.bounds.x && centerX <= artwork.bounds.x + artwork.bounds.width &&
+      centerY >= artwork.bounds.top && centerY <= artwork.bounds.top + artwork.bounds.height
+  }).length >= 2
+  // A single signature/date row or a dotted leader is still ordinary flow.
+  // Repeated separated rows are the reliable signal for a real multi-column
+  // or form-like composition that needs absolute editable objects.
+  return wideSeparatedLines >= 3 || textOverArtwork
+}
+
 function blockListIndent(block, bodyFontSize) {
   if (block.fontSize > bodyFontSize * 1.18) return null
   const firstLine = block.lines[0]
@@ -204,13 +299,38 @@ function blockListIndent(block, bodyFontSize) {
   return {
     left: Math.round(textX * 20),
     hanging: Math.max(120, Math.round((textX - first.x) * 20)),
+    markerTab: separateMarker,
+    tabPosition: Math.round(textX * 20),
   }
 }
 
-function blockAlignment(block, page, AlignmentType, listIndent) {
-  if (listIndent) return AlignmentType.LEFT
+function blockColumnTabs(block) {
+  if (block.lines.length !== 1) return []
+  const segments = (block.lines[0].segments || []).filter((segment) => segment.items.some((item) => item.text.trim()))
+  return segments.slice(1).filter((segment, index) => {
+    const previous = segments[index]
+    return segment.x - (previous.x + previous.width) > 36
+  }).map((segment) => ({
+    itemId: segment.items.find((item) => item.text.trim())?.id,
+    position: Math.round(segment.x * 20),
+  })).filter((stop) => stop.itemId)
+}
+
+function blockAlignment(block, page, AlignmentType, listIndent, columnTabs = []) {
+  if (listIndent || columnTabs.length) return AlignmentType.LEFT
   const center = block.x + block.width / 2
   const pageCenter = page.width / 2
+  if (block.lines.length > 1) {
+    const leftEdges = block.lines.map((line) => line.x)
+    const rightEdges = block.lines.map((line) => line.right)
+    const centers = block.lines.map((line) => line.x + line.width / 2)
+    const spread = (values) => Math.max(...values) - Math.min(...values)
+    const bodyFontSize = pageBodyFontSize(page)
+    const headingLike = block.fontSize >= bodyFontSize * 1.3 || /^(?:Title|H[1-6])$/.test(block.role || '')
+    if (!headingLike && spread(leftEdges) <= Math.max(3, block.fontSize * 0.45)) return AlignmentType.LEFT
+    if (spread(rightEdges) <= Math.max(3, block.fontSize * 0.45)) return AlignmentType.RIGHT
+    if (spread(centers) <= Math.max(5, block.fontSize * 0.7)) return AlignmentType.CENTER
+  }
   if (block.width < page.width * 0.78 && Math.abs(center - pageCenter) <= page.width * 0.025) {
     return AlignmentType.CENTER
   }
@@ -229,17 +349,32 @@ function blockOutlineLevel(block, bodyFontSize) {
   return undefined
 }
 
-function lineWordChildren(line, page, word) {
-  const { ExternalHyperlink, InternalHyperlink, TextRun } = word
+function lineWordChildren(line, page, word, { markerTab = false, forceBold = false, columnTabs = [] } = {}) {
+  const { ExternalHyperlink, InternalHyperlink, Tab, TextRun } = word
   const children = []
   let previousRight = null
   let pendingSpace = false
+  let skipNextGap = false
+  const firstVisible = markerTab ? line.items.find((item) => item.text.trim()) : null
   for (const item of line.items) {
     if (!item.text.trim()) {
-      pendingSpace ||= children.length > 0
+      if (!skipNextGap) pendingSpace ||= children.length > 0
       continue
     }
-    if (pendingSpace) {
+    const columnStop = columnTabs.find((stop) => stop.itemId === item.id)
+    if (columnStop && children.length) {
+      children.push(new TextRun({
+        children: [new Tab()],
+        font: wordFontName(item.fontFamily),
+        size: Math.max(4, Math.min(400, Math.round(item.fontSize * 2))),
+      }))
+      pendingSpace = false
+      skipNextGap = true
+      previousRight = null
+    }
+    if (skipNextGap) {
+      skipNextGap = false
+    } else if (pendingSpace) {
       children.push(new TextRun({
         text: ' ',
         font: wordFontName(item.fontFamily),
@@ -260,7 +395,7 @@ function lineWordChildren(line, page, word) {
       text: item.text,
       font: wordFontName(item.fontFamily),
       size: Math.max(4, Math.min(400, Math.round(item.fontSize * 2))),
-      bold: item.bold,
+      bold: forceBold || item.bold,
       italics: item.italics,
       color: String(item.color || '000000').replace(/^#/, ''),
       vanish: item.visible === false,
@@ -274,18 +409,35 @@ function lineWordChildren(line, page, word) {
           ? new InternalHyperlink({ children: [run], anchor: `pdf-page-${item.destinationPageNumber}` })
           : run,
     )
+    if (item === firstVisible) {
+      children.push(new TextRun({
+        children: [new Tab()],
+        font: wordFontName(item.fontFamily),
+        size: Math.max(4, Math.min(400, Math.round(item.fontSize * 2))),
+      }))
+      skipNextGap = true
+    }
     previousRight = item.x + item.width
     pendingSpace = false
   }
   return children.length ? children : [new TextRun('')]
 }
 
-function blockWordChildren(block, page, word) {
+function blockWordChildren(block, page, word, { markerTab = false, forceBold = false, columnTabs = [] } = {}) {
   const { TextRun } = word
   const children = []
+  const preserveSourceBreaks = /(?:https?:\/\/|www\.)/i.test(block.text)
   block.lines.forEach((line, index) => {
-    children.push(...lineWordChildren(line, page, word))
+    children.push(...lineWordChildren(line, page, word, {
+      markerTab: markerTab && index === 0,
+      forceBold,
+      columnTabs: index === 0 ? columnTabs : [],
+    }))
     if (index === block.lines.length - 1) return
+    if (preserveSourceBreaks) {
+      children.push(new TextRun({ break: 1 }))
+      return
+    }
     const tail = [...line.items].reverse().find((item) => item.text.trim())?.text.trimEnd() || ''
     const next = block.lines[index + 1].items.find((item) => item.text.trim())?.text.trimStart() || ''
     if (!tail.endsWith('-') && !/^[,.;:!?)]/.test(next)) {
@@ -299,11 +451,39 @@ function blockWordChildren(block, page, word) {
   return children
 }
 
-function wordTable(table, page, word) {
+function cellItemLines(items) {
+  const lines = []
+  for (const item of [...(items || [])].sort((a, b) => a.baseline - b.baseline || a.x - b.x)) {
+    const line = lines.findLast((candidate) =>
+      Math.abs(candidate.baseline - item.baseline) <= Math.max(1.5, item.fontSize * 0.34))
+    if (line) {
+      line.items.push(item)
+      line.baseline = (line.baseline * (line.items.length - 1) + item.baseline) / line.items.length
+    } else {
+      lines.push({ items: [item], baseline: item.baseline })
+    }
+  }
+  for (const line of lines) line.items.sort((a, b) => a.x - b.x)
+  return lines
+}
+
+function cellBackgroundColor(cell) {
+  const colors = (cell?.items || [])
+    .map((item) => String(item.backgroundColor || '').replace(/^#/, '').toUpperCase())
+    .filter((color) => /^[0-9A-F]{6}$/.test(color) && !/^(?:FFFFFF|FEFEFE|FDFDFD)$/.test(color))
+  if (!colors.length) return cell?.header ? 'E9E4DA' : undefined
+  return [...new Set(colors)].sort((a, b) =>
+    colors.filter((color) => color === b).length - colors.filter((color) => color === a).length)[0]
+}
+
+function wordTable(table, page, word, { positioned = false } = {}) {
   const {
+    AlignmentType,
     HeightRule,
+    OverlapType,
     Paragraph,
     Table,
+    TableAnchorType,
     TableCell,
     TableLayoutType,
     TableRow,
@@ -321,31 +501,57 @@ function wordTable(table, page, word) {
     })
   const measuredTotal = measured.reduce((sum, value) => sum + value, 0)
   const columnWidths = measured.map((value) => Math.max(60, Math.round((value / measuredTotal) * widthTwips)))
+  const exactGeometry = positioned || /^vector-table-/.test(table.id || '')
   return new Table({
     width: { size: widthTwips, type: WidthType.DXA },
-    indent: { size: Math.max(0, Math.round(table.bounds.x * 20)), type: WidthType.DXA },
+    indent: positioned ? undefined : { size: Math.max(0, Math.round(table.bounds.x * 20)), type: WidthType.DXA },
+    float: positioned ? {
+      horizontalAnchor: TableAnchorType.PAGE,
+      verticalAnchor: TableAnchorType.PAGE,
+      absoluteHorizontalPosition: Math.max(0, Math.round(table.bounds.x * 20)),
+      absoluteVerticalPosition: Math.max(0, Math.round(table.bounds.top * 20)),
+      leftFromText: 0,
+      rightFromText: 0,
+      topFromText: 0,
+      bottomFromText: 0,
+      overlap: OverlapType.OVERLAP,
+    } : undefined,
     columnWidths,
     layout: TableLayoutType.FIXED,
-    margins: { top: 20, right: 30, bottom: 20, left: 30 },
+    margins: { top: 20, right: 60, bottom: 20, left: 60 },
     rows: table.rows.map((cells) => {
       const rowTop = Math.min(...cells.map((cell) => cell.bounds.top))
       const rowBottom = Math.max(...cells.map((cell) => cell.bounds.top + cell.bounds.height))
       return new TableRow({
-        height: { value: Math.max(120, Math.round((rowBottom - rowTop + 2) * 20)), rule: HeightRule.ATLEAST },
+        height: {
+          value: Math.max(120, Math.round((rowBottom - rowTop + (exactGeometry ? 0 : 2)) * 20)),
+          rule: exactGeometry ? HeightRule.EXACT : HeightRule.ATLEAST,
+        },
         children: cells.map((cell, column) => {
           const fontSize = cell?.items?.length
             ? Math.max(6, Math.min(72, Math.max(...cell.items.map((item) => item.fontSize))))
             : 9
-          const cellParagraphs = String(cell?.text || '').split('\n')
+          const itemLines = cellItemLines(cell?.items)
+          const cellParagraphs = itemLines.length ? itemLines : String(cell?.text || '').split('\n').map((text) => ({ text }))
           return new TableCell({
             width: { size: Math.max(60, Math.round((cell?.bounds?.width || columnWidths[column] / 20) * 20)), type: WidthType.DXA },
             columnSpan: Math.max(1, cell?.columnSpan || 1),
             verticalAlign: VerticalAlign.CENTER,
-            shading: cell?.header ? { fill: 'E9E4DA', color: 'auto' } : undefined,
-            children: cellParagraphs.map((text) => new Paragraph({
+            shading: cellBackgroundColor(cell) ? { fill: cellBackgroundColor(cell), color: 'auto' } : undefined,
+            children: cellParagraphs.map((line) => new Paragraph({
+              alignment: line.items?.length ? (() => {
+                const bounds = lineBounds(line.items)
+                const leftGap = Math.max(0, bounds.x - cell.bounds.x)
+                const rightGap = Math.max(0, cell.bounds.x + cell.bounds.width - bounds.right)
+                return Math.abs(leftGap - rightGap) <= Math.max(3, cell.bounds.width * 0.08)
+                  ? AlignmentType.CENTER
+                  : rightGap + Math.max(3, cell.bounds.width * 0.06) < leftGap
+                    ? AlignmentType.RIGHT
+                    : AlignmentType.LEFT
+              })() : AlignmentType.LEFT,
               spacing: { before: 0, after: 0 },
-              children: [new TextRun({
-                text,
+              children: line.items?.length ? lineWordChildren(line, page, word) : [new TextRun({
+                text: line.text,
                 bold: Boolean(cell?.header),
                 font: wordFontName(cell?.items?.[0]?.fontFamily),
                 size: Math.round(fontSize * 2),
@@ -355,6 +561,67 @@ function wordTable(table, page, word) {
         }),
       })
     }),
+  })
+}
+
+function positionedWordTextBox(block, page, word, alignment, outlineLevel) {
+  const {
+    HorizontalPositionRelativeFrom,
+    LineRuleType,
+    Paragraph,
+    TextWrappingType,
+    VerticalAnchor,
+    VerticalPositionRelativeFrom,
+    WpsShapeRun,
+  } = word
+  const width = Math.max(8, Math.min(page.width - block.x, block.width + 6))
+  const height = Math.max(8, block.height + Math.max(4, block.fontSize * 0.35))
+  return new Paragraph({
+    spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
+    children: [new WpsShapeRun({
+      type: 'wps',
+      transformation: {
+        width: Math.max(1, Math.round((width * 96) / 72)),
+        height: Math.max(1, Math.round((height * 96) / 72)),
+      },
+      floating: {
+        horizontalPosition: {
+          relative: HorizontalPositionRelativeFrom.PAGE,
+          offset: Math.max(0, Math.round(block.x * 12_700)),
+        },
+        verticalPosition: {
+          relative: VerticalPositionRelativeFrom.PAGE,
+          offset: Math.max(0, Math.round(block.top * 12_700)),
+        },
+        allowOverlap: true,
+        wrap: { type: TextWrappingType.NONE },
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+      },
+      altText: {
+        title: block.text.slice(0, 80) || 'Editable PDF text',
+        description: 'Editable text reconstructed at its original PDF page position.',
+        name: `Editable text on PDF page ${page.pageNumber}`,
+      },
+      outline: { type: 'noFill' },
+      nonVisualProperties: { txBox: '1' },
+      bodyProperties: {
+        margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        verticalAnchor: VerticalAnchor.TOP,
+        noAutoFit: true,
+      },
+      children: [new Paragraph({
+        outlineLevel,
+        alignment,
+        bidirectional: block.lines.some((line) => line.items.some((item) => item.dir === 'rtl')),
+        spacing: {
+          before: 0,
+          after: 0,
+          line: Math.max(20, Math.round(block.linePitch * 20)),
+          lineRule: LineRuleType.AT_LEAST,
+        },
+        children: blockWordChildren(block, page, word),
+      })],
+    })],
   })
 }
 
@@ -373,6 +640,7 @@ export async function semanticPdfPagesToDocx({ title, pages, metadata = {} }) {
     Packer,
     Paragraph,
     SectionType,
+    TabStopType,
     TextRun,
     TextWrappingType,
     VerticalPositionRelativeFrom,
@@ -386,12 +654,21 @@ export async function semanticPdfPagesToDocx({ title, pages, metadata = {} }) {
         children: [new TextRun({ text: '', vanish: true })],
       })],
     })]
+    const verticalSpacer = (height) => new Paragraph({
+      spacing: {
+        before: 0,
+        after: 0,
+        line: Math.max(1, Math.round(height * 20)),
+        lineRule: LineRuleType.EXACT,
+      },
+      children: [new TextRun({ text: '', vanish: true })],
+    })
     const artwork = page.graphics?.bytes
       ? page.graphics
       : page.graphics
         ? { bytes: page.graphics, bounds: { x: 0, top: 0, width: page.width, height: page.height } }
         : null
-    if (artwork && page.hasRasterGraphics !== false) {
+    if (artwork) {
       children.push(new Paragraph({
         spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
         children: [new ImageRun({
@@ -425,12 +702,17 @@ export async function semanticPdfPagesToDocx({ title, pages, metadata = {} }) {
     }
 
     const bodyFontSize = pageBodyFontSize(page)
+    const tableOfContents = pageIsTableOfContents(page)
     const allFlowBlocks = pageFlowBlocks(page)
     const pageNumberBlock = allFlowBlocks.find((block) =>
       block.top > page.height * 0.9 && /^\d+$/.test(block.text.trim()))
     const flowBlocks = allFlowBlocks.filter((block) => block !== pageNumberBlock)
+    const positioned = pageUsesPositionedLayout(page)
+    const textBlocks = positioned
+      ? positionedPageBlocks(page).filter((block) => !pageNumberBlock || Math.abs(block.top - pageNumberBlock.top) > 1)
+      : flowBlocks
     const flowNodes = [
-      ...flowBlocks.map((block) => ({ type: 'text', top: block.top, bottom: block.bottom, block })),
+      ...textBlocks.map((block) => ({ type: 'text', top: block.top, bottom: block.bottom, block })),
       ...page.tables.map((table) => ({
         type: 'table',
         top: table.bounds.top,
@@ -442,54 +724,72 @@ export async function semanticPdfPagesToDocx({ title, pages, metadata = {} }) {
     for (const node of flowNodes) {
       const before = Math.max(0, node.top - sourceBottom)
       if (node.type === 'table') {
-        if (before > 0.5) {
-          children.push(new Paragraph({
-            spacing: {
-              before: Math.round(before * 20),
-              after: 0,
-              line: 1,
-              lineRule: LineRuleType.EXACT,
-            },
-            children: [new TextRun({ text: '', vanish: true })],
-          }))
+        if (!positioned) {
+          if (before > 0.5) children.push(verticalSpacer(before))
+          children.push(wordTable(node.table, page, word, { positioned: true }))
+          children.push(verticalSpacer(node.table.bounds.height))
+        } else {
+          children.push(wordTable(node.table, page, word, { positioned: true }))
         }
-        children.push(wordTable(node.table, page, word))
         sourceBottom = Math.max(sourceBottom, node.bottom)
         continue
       }
 
       const { block } = node
       const listIndent = blockListIndent(block, bodyFontSize)
-      const alignment = blockAlignment(block, page, AlignmentType, listIndent)
+      const columnTabs = blockColumnTabs(block)
+      const alignment = blockAlignment(block, page, AlignmentType, listIndent, columnTabs)
       let left = Math.max(0, Math.min(page.width - 6, block.x))
-      const rightEdge = Math.max(left + 6, Math.min(page.width, block.right))
+      const metricTolerance = !tableOfContents && (block.lines.length === 1 || /(?:https?:\/\/|www\.)/i.test(block.text))
+        ? Math.max(4, block.fontSize * 0.55)
+        : 0
+      const rightEdge = Math.max(left + 6, Math.min(page.width, block.right + metricTolerance))
       let right = Math.max(0, page.width - rightEdge)
       if (/\.{4,}/.test(block.text)) {
         left = Math.max(36, left - 18)
         right = Math.max(36, right - 18)
       }
-      const symmetric = Math.max(0, Math.min(left, right, page.width * 0.09))
-      const indent = listIndent || (alignment === AlignmentType.CENTER
-        ? { left: Math.round(symmetric * 20), right: Math.round(symmetric * 20) }
+      let indent = listIndent
+        ? { left: listIndent.left, hanging: listIndent.hanging, right: Math.round(right * 20) }
+        : (alignment === AlignmentType.CENTER
+        ? { left: Math.round(left * 20), right: Math.round(right * 20) }
         : alignment === AlignmentType.RIGHT
           ? { left: Math.round(Math.min(left, page.width * 0.15) * 20), right: Math.round(right * 20) }
           : { left: Math.round(left * 20), right: Math.round(right * 20) })
+      const tocNumber = tableOfContents ? block.text.trim().match(/^(\d+(?:\.\d+)*)/)?.[1] : null
+      const tocLevel = tocNumber ? tocNumber.split('.').length - 1 : 0
+      if (tocLevel > 0) indent = { ...indent, left: (indent.left || 0) + tocLevel * 440 }
+      const topLevelTocEntry = Boolean(tableOfContents && tocNumber && tocLevel === 0)
       const outlineLevel = blockOutlineLevel(block, bodyFontSize)
+      if (positioned) {
+        children.push(positionedWordTextBox(block, page, word, alignment, outlineLevel))
+        sourceBottom = Math.max(sourceBottom, node.bottom)
+        continue
+      }
+      if (before > 0.5) children.push(verticalSpacer(before))
       children.push(new Paragraph({
         outlineLevel,
         alignment,
+        tabStops: [
+          ...(listIndent?.markerTab ? [{ type: TabStopType.LEFT, position: listIndent.tabPosition }] : []),
+          ...columnTabs.map((stop) => ({ type: TabStopType.LEFT, position: stop.position })),
+        ],
         keepNext: outlineLevel !== undefined,
         bidirectional: block.lines.some((line) => line.items.some((item) => item.dir === 'rtl')),
         indent,
         spacing: {
-          before: Math.round(before * 20),
+          before: 0,
           after: 0,
           line: Math.max(20, Math.round(block.linePitch * 20)),
-          lineRule: LineRuleType.AT_LEAST,
+          lineRule: LineRuleType.EXACT,
         },
-        children: blockWordChildren(block, page, word),
+        children: blockWordChildren(block, page, word, {
+          markerTab: Boolean(listIndent?.markerTab),
+          forceBold: topLevelTocEntry,
+          columnTabs,
+        }),
       }))
-      sourceBottom = Math.max(sourceBottom, node.bottom)
+      sourceBottom = Math.max(sourceBottom, block.top + block.lines.length * block.linePitch)
     }
     if (!children.length) children.push(new Paragraph(''))
     const footerItem = pageNumberBlock?.lines[0]?.items.find((item) => item.text.trim())

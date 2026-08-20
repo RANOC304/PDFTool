@@ -5,6 +5,9 @@ const root = resolve(import.meta.dirname, '..')
 const outputDirectory = 'dist'
 const indexPath = resolve(root, outputDirectory, 'index.html')
 const vercel = JSON.parse(readFileSync(resolve(root, 'vercel.json'), 'utf8'))
+const deploymentHeaders = Object.fromEntries(
+  (vercel.headers || []).flatMap((rule) => rule.headers || []).map(({ key, value }) => [key.toLowerCase(), value]),
+)
 
 if (vercel.outputDirectory !== outputDirectory) {
   throw new Error(`Vercel must publish ${outputDirectory}/, not ${vercel.outputDirectory || 'an implicit directory'}.`)
@@ -14,6 +17,11 @@ if ((vercel.rewrites || []).some(({ source, destination }) =>
   source === '/(.*)' && /index\.html$/.test(destination || ''),
 )) {
   throw new Error('A catch-all index.html rewrite can turn missing JavaScript into text/html responses.')
+}
+
+if (deploymentHeaders['cross-origin-opener-policy'] !== 'same-origin' ||
+    deploymentHeaders['cross-origin-embedder-policy'] !== 'require-corp') {
+  throw new Error('Vercel must preserve the COOP/COEP headers required by LibreOffice WebAssembly threads.')
 }
 
 if (!existsSync(indexPath)) {
@@ -44,4 +52,5 @@ console.log(JSON.stringify({
   referencedAssets: assetUrls.length,
   missingAssets: 0,
   catchAllHtmlRewrite: false,
+  libreOfficeThreadIsolation: true,
 }, null, 2))

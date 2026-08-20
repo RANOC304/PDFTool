@@ -1,5 +1,6 @@
 import * as pdfjsLib from 'pdfjs-dist'
 import { annotationRectangle, pdfDestinationPageNumber, vectorTableGrids } from './pdfGeometry.js'
+import { repairPdfTextSpacing } from './pdfTextRepair.js'
 
 const TEXT_PAINT_OPERATIONS = new Set([
   pdfjsLib.OPS.showText,
@@ -76,6 +77,24 @@ function normalizedColor(value, fallback = '000000') {
   return fallback
 }
 
+function grayColor(args) {
+  const value = Array.isArray(args?.[0]) || ArrayBuffer.isView(args?.[0]) ? args[0][0] : args?.[0]
+  return normalizedColor([value ?? 0, value ?? 0, value ?? 0])
+}
+
+function cmykColor(args) {
+  const values = Array.isArray(args?.[0]) || ArrayBuffer.isView(args?.[0]) ? [...args[0]] : [...(args || [])]
+  const [cyan = 0, magenta = 0, yellow = 0, black = 0] = values.map((value) => {
+    const numeric = Number(value) || 0
+    return Math.max(0, Math.min(1, numeric > 1 ? numeric / 255 : numeric))
+  })
+  return normalizedColor([
+    1 - Math.min(1, cyan + black),
+    1 - Math.min(1, magenta + black),
+    1 - Math.min(1, yellow + black),
+  ])
+}
+
 function glyphText(value) {
   if (Array.isArray(value)) return value.map(glyphText).join('')
   if (value && typeof value === 'object') return value.unicode || value.fontChar || ''
@@ -92,6 +111,8 @@ function textPaintStyles(operatorList) {
     if (operation === pdfjsLib.OPS.save) stack.push({ ...state })
     else if (operation === pdfjsLib.OPS.restore) state = stack.pop() || state
     else if (operation === pdfjsLib.OPS.setFillRGBColor) state.color = normalizedColor(args[0])
+    else if (operation === pdfjsLib.OPS.setFillGray) state.color = grayColor(args)
+    else if (operation === pdfjsLib.OPS.setFillCMYKColor) state.color = cmykColor(args)
     else if (operation === pdfjsLib.OPS.setFont) state = { ...state, fontName: args[0] || '', fontSize: Math.abs(args[1] || state.fontSize) }
     else if (operation === pdfjsLib.OPS.setTextRenderingMode) state = { ...state, renderingMode: Number(args[0]) || 0 }
     else if (TEXT_PAINT_OPERATIONS.has(operation)) {
@@ -106,6 +127,42 @@ function textPaintStyles(operatorList) {
     }
   }
   return styles
+}
+
+function comparablePaintText(value) {
+  return String(value || '').replace(/\s+/g, '')
+}
+
+function consumePaintStyle(text, styles, cursor) {
+  const target = comparablePaintText(text)
+  if (!target) return {}
+
+  // Quartz and several Office PDF writers emit one paint operation per glyph
+  // while PDF.js combines those glyphs into complete textContent lines. Match
+  // the sequential glyph stream, not an arbitrary shared character (which
+  // previously made a body line ending in a period inherit the heading colour).
+  const startLimit = Math.min(styles.length, cursor.index + 256)
+  for (let start = cursor.index; start < startLimit; start++) {
+    let assembled = ''
+    let firstStyle = null
+    const endLimit = Math.min(styles.length, start + Math.max(32, target.length * 3))
+    for (let end = start; end < endLimit; end++) {
+      const candidate = comparablePaintText(styles[end]?.text)
+      if (!candidate) continue
+      firstStyle ||= styles[end]
+      assembled += candidate
+      if (!target.startsWith(assembled) && !assembled.startsWith(target)) break
+      if (assembled.length >= target.length) {
+        cursor.index = end + 1
+        return firstStyle || {}
+      }
+    }
+  }
+
+  const fallback = styles.slice(cursor.index).findIndex((style) => comparablePaintText(style.text))
+  if (fallback < 0) return {}
+  cursor.index += fallback + 1
+  return styles[cursor.index - 1] || {}
 }
 
 function buildStructureMap(tree) {
@@ -427,60 +484,37 @@ function sampledBackground(context, canvas, item, scale) {
   return median.map((value) => value.toString(16).padStart(2, '0')).join('').toUpperCase()
 }
 
-function cropArtworkCanvas(canvas, context, scale, items) {
-  for (const item of items) {
-    const padding = Math.max(1, item.fontSize * 0.18) * scale
-    context.clearRect(
-      Math.floor(item.x * scale - padding),
-      Math.floor(item.top * scale - padding),
-      Math.ceil(item.width * scale + padding * 2),
-      Math.ceil(item.height * scale + padding * 2),
-    )
-  }
-
+function cropArtworkCanvas(canvas, context, scale) {
   const image = context.getImageData(0, 0, canvas.width, canvas.height)
   const { data } = image
   const pixelCount = canvas.width * canvas.height
-  const visited = new Uint8Array(pixelCount)
-  const queue = new Int32Array(pixelCount)
-  let head = 0
-  let tail = 0
-  const isBackground = (pixel) => {
-    const offset = pixel * 4
-    const red = data[offset]
-    const green = data[offset + 1]
-    const blue = data[offset + 2]
-    return data[offset + 3] > 0 && red >= 245 && green >= 245 && blue >= 245 &&
-      Math.max(red, green, blue) - Math.min(red, green, blue) <= 10
-  }
-  const enqueue = (pixel) => {
-    if (visited[pixel] || !isBackground(pixel)) return
-    visited[pixel] = 1
-    queue[tail++] = pixel
-  }
-  for (let x = 0; x < canvas.width; x++) {
-    enqueue(x)
-    enqueue((canvas.height - 1) * canvas.width + x)
-  }
-  for (let y = 0; y < canvas.height; y++) {
-    enqueue(y * canvas.width)
-    enqueue(y * canvas.width + canvas.width - 1)
-  }
-  while (head < tail) {
-    const pixel = queue[head++]
-    const x = pixel % canvas.width
-    if (x > 0) enqueue(pixel - 1)
-    if (x < canvas.width - 1) enqueue(pixel + 1)
-    if (pixel >= canvas.width) enqueue(pixel - canvas.width)
-    if (pixel < pixelCount - canvas.width) enqueue(pixel + canvas.width)
+  const cornerOffsets = [
+    0,
+    (canvas.width - 1) * 4,
+    (canvas.height - 1) * canvas.width * 4,
+    ((canvas.height - 1) * canvas.width + canvas.width - 1) * 4,
+  ]
+  const corners = cornerOffsets.map((offset) => [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+  const whitePageBackground = corners.every(([red, green, blue, alpha]) =>
+    alpha >= 250 && red >= 246 && green >= 246 && blue >= 246)
+  const isArtworkPixel = (offset) => {
+    const alpha = data[offset + 3]
+    if (alpha <= 2) return false
+    if (!whitePageBackground) return true
+    // Many PDF producers paint an opaque white page rectangle. Treat only
+    // near-white pixels as that removable canvas; coloured/black artwork and
+    // white details surrounded by real artwork still retain the same bounds.
+    return data[offset] < 244 || data[offset + 1] < 244 || data[offset + 2] < 244
   }
 
   let minX = canvas.width
   let minY = canvas.height
   let maxX = -1
   let maxY = -1
+  let artworkPixels = 0
   for (let pixel = 0; pixel < pixelCount; pixel++) {
-    if (data[pixel * 4 + 3] <= 2 || visited[pixel]) continue
+    if (!isArtworkPixel(pixel * 4)) continue
+    artworkPixels++
     const x = pixel % canvas.width
     const y = Math.floor(pixel / canvas.width)
     minX = Math.min(minX, x)
@@ -503,10 +537,38 @@ function cropArtworkCanvas(canvas, context, scale, items) {
   return {
     canvas: cropped,
     bounds: { x: minX / scale, top: minY / scale, width: width / scale, height: height / scale },
+    coverage: artworkPixels / Math.max(1, width * height),
   }
 }
 
-async function renderGraphicsLayer(page, viewport, operatorList, dpi, { items = [], includeBytes = true } = {}) {
+function clearNativeTableGridArtwork(context, tables, scale) {
+  for (const table of tables || []) {
+    if (!/^vector-table-/.test(table.id || '')) continue
+    const xs = new Set()
+    const ys = new Set()
+    for (const row of table.rows || []) {
+      for (const cell of row) {
+        xs.add(cell.bounds.x)
+        xs.add(cell.bounds.x + cell.bounds.width)
+        ys.add(cell.bounds.top)
+        ys.add(cell.bounds.top + cell.bounds.height)
+      }
+    }
+    const thickness = Math.max(2, Math.ceil(scale * 1.5))
+    const x = Math.round(table.bounds.x * scale)
+    const y = Math.round(table.bounds.top * scale)
+    const width = Math.ceil(table.bounds.width * scale)
+    const height = Math.ceil(table.bounds.height * scale)
+    for (const borderX of xs) {
+      context.clearRect(Math.round(borderX * scale - thickness / 2), y - thickness, thickness, height + thickness * 2)
+    }
+    for (const borderY of ys) {
+      context.clearRect(x - thickness, Math.round(borderY * scale - thickness / 2), width + thickness * 2, thickness)
+    }
+  }
+}
+
+async function renderGraphicsLayer(page, viewport, operatorList, dpi, { items = [], tables = [], includeBytes = true } = {}) {
   if (!operatorList.fnArray.some((operation) => GRAPHIC_PAINT_OPERATIONS.has(operation))) return null
   const scale = Math.min(dpi / 72, Math.sqrt(24_000_000 / Math.max(1, viewport.width * viewport.height)))
   const renderViewport = page.getViewport({ scale })
@@ -523,12 +585,16 @@ async function renderGraphicsLayer(page, viewport, operatorList, dpi, { items = 
     operationsFilter: (index) => !TEXT_PAINT_OPERATIONS.has(operatorList.fnArray[index]),
   }).promise
   for (const item of items) item.backgroundColor = sampledBackground(context, canvas, item, scale)
-  const cropped = includeBytes ? cropArtworkCanvas(canvas, context, scale, items) : null
+  clearNativeTableGridArtwork(context, tables, scale)
+  // Text paint operations were excluded from the render itself. Clearing each
+  // text bounding box here would also erase the genuine vector background
+  // beneath that text (for example white lettering on a dark banner).
+  const cropped = includeBytes ? cropArtworkCanvas(canvas, context, scale) : null
   const bytes = cropped ? await canvasBlob(cropped.canvas) : null
   cropped?.canvas && (cropped.canvas.width = 0)
   canvas.width = 0
   canvas.height = 0
-  return bytes ? { bytes, bounds: cropped.bounds } : null
+  return bytes ? { bytes, bounds: cropped.bounds, coverage: cropped.coverage } : null
 }
 
 async function semanticPage(page, pageNumber, { includeGraphics, sampleBackgrounds, graphicsDpi }) {
@@ -541,7 +607,7 @@ async function semanticPage(page, pageNumber, { includeGraphics, sampleBackgroun
   ])
   const structureMap = buildStructureMap(structureTree)
   const paintStyles = textPaintStyles(operatorList)
-  let paintStyleIndex = 0
+  const paintStyleCursor = { index: 0 }
   const items = []
   const markedStack = []
 
@@ -563,15 +629,12 @@ async function semanticPage(page, pageNumber, { includeGraphics, sampleBackgroun
     const markedId = [...markedStack].reverse().find(Boolean)
     const structurePath = structureMap.get(markedId)?.path || []
     const role = structurePath.at(-1)?.role || 'P'
-    while (paintStyleIndex < paintStyles.length && !paintStyles[paintStyleIndex].text) paintStyleIndex++
-    const paintStyle = paintStyles[paintStyleIndex] || {}
-    if (paintStyle.text && (paintStyle.text === entry.str || paintStyle.text.includes(entry.str) || entry.str.includes(paintStyle.text))) {
-      paintStyleIndex++
-    }
+    const repairedText = repairPdfTextSpacing(entry.str)
+    const paintStyle = consumePaintStyle(repairedText, paintStyles, paintStyleCursor)
     const traits = fontTraits(style, entry.fontName, internalFont)
     items.push({
       id: `text-${items.length}`,
-      text: entry.str,
+      text: repairedText,
       x,
       top,
       baseline,
@@ -601,9 +664,13 @@ async function semanticPage(page, pageNumber, { includeGraphics, sampleBackgroun
   const tableItemIds = new Set(tables.flatMap((table) => [...table.itemIds]))
   const hasGraphics = operatorList.fnArray.some((operation) => GRAPHIC_PAINT_OPERATIONS.has(operation))
   const hasRasterGraphics = operatorList.fnArray.some((operation) => RASTER_GRAPHIC_OPERATIONS.has(operation))
-  const shouldRenderGraphics = (sampleBackgrounds && hasGraphics) || (includeGraphics && hasRasterGraphics)
+  const shouldRenderGraphics = (sampleBackgrounds && hasGraphics) || (includeGraphics && hasGraphics)
   const graphics = shouldRenderGraphics
-    ? await renderGraphicsLayer(page, viewport, operatorList, graphicsDpi, { items, includeBytes: includeGraphics && hasRasterGraphics })
+    ? await renderGraphicsLayer(page, viewport, operatorList, graphicsDpi, {
+      items,
+      tables,
+      includeBytes: includeGraphics && hasGraphics,
+    })
     : null
 
   return {

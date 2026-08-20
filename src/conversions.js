@@ -71,10 +71,20 @@ export const FIDELITY = {
     short: 'Visual replica',
     detail: 'The original composition, page size, colour and typography are reproduced as print-quality page artwork. Editing layers and native source objects are intentionally flattened.',
   },
+  officePdf: {
+    label: 'Native office PDF export',
+    short: 'Writer-native PDF',
+    detail: 'LibreOffice Writer exports the paginated document with native PDF text, vectors, links, images, metadata and mixed page geometry. Word-only editing objects are represented through the PDF content model.',
+  },
   structured: {
     label: 'Native structured output',
     short: 'Structured',
     detail: 'Rows, fields, values and data types supported by both formats remain native and editable. Format-specific syntax, quoting and unsupported nested types may be normalized.',
+  },
+  reconstructed: {
+    label: 'Editable page reconstruction',
+    short: 'Editable layout',
+    detail: 'Text, links and detected tables become native editable Word objects. Designed pages use positioned text boxes and artwork layers to retain source geometry; ordinary prose remains normal reflowable paragraphs.',
   },
   extract: {
     label: 'Content extraction',
@@ -132,7 +142,11 @@ export const QUALITY_GATE_POLICIES = {
   },
   pdf: {
     label: 'PDF content and page fidelity',
-    checks: ['page count and geometry', 'native editable text', 'real tables and links', 'non-text artwork isolation', 'scan-only refusal', 'source metadata'],
+    checks: ['page count and geometry', 'native editable text', 'real tables and links', 'complete non-text artwork layer', 'scan-only refusal', 'source metadata'],
+  },
+  'docx-pdf': {
+    label: 'LibreOffice Writer page fidelity',
+    checks: ['OOXML pagination', 'headers, footers and notes', 'tables, drawings and sections', 'native PDF text and vectors', 'mixed page geometry', 'live links and metadata'],
   },
   psd: {
     label: 'Layered-artwork fidelity',
@@ -194,6 +208,16 @@ export const QUALITY_GATE_POLICIES = {
 
 const SPECIALIZED_GROUPS = [
   {
+    id: 'word',
+    routes: [
+      route(
+        'docx-pdf', 'docx', 'pdf', 'DOCX', 'PDF', FORMATS.docx.accept,
+        'Runs LibreOffice Writer locally in WebAssembly and exports its native PDF representation, preserving page geometry, typography, tables, drawings, headers, footers, notes, links and mixed sections. The office runtime downloads once; document bytes stay in the browser. Embedded webviews without WebAssembly thread isolation use a 288-DPI rendered-page fallback. PDF has no equivalent Word editing model, so source editing objects become PDF page content.',
+        'officePdf', { handler: 'docx-pdf' },
+      ),
+    ],
+  },
+  {
     id: 'photoshop',
     routes: [
       route('psd-docx', 'psd', 'docx', 'PSD', 'DOCX', FORMATS.psd.accept, 'Creates a Word document with the flattened artwork, document details and a layer list.', 'extract'),
@@ -211,7 +235,7 @@ const SPECIALIZED_GROUPS = [
       route('pdf-jpg', 'pdf', 'jpg', 'PDF', 'JPG', FORMATS.pdf.accept, 'Renders every page at print quality, then encodes maximum-quality 4:4:4 JPEG; multiple pages are delivered in a ZIP.', 'flatten'),
       route('pdf-webp', 'pdf', 'webp', 'PDF', 'WEBP', FORMATS.pdf.accept, 'Renders every page at print quality with exact lossless WebP encoding; multiple pages are delivered in a ZIP.', 'flatten'),
       route('pdf-txt', 'pdf', 'txt', 'PDF', 'TXT', FORMATS.pdf.accept, 'Extracts selectable text from every page. Scanned pages need OCR first.', 'extract'),
-      route('pdf-docx', 'pdf', 'docx', 'PDF', 'DOCX', FORMATS.pdf.accept, 'Reconstructs real editable Word text, links and tables at the original page geometry; only genuine non-text artwork is retained as imagery. Scan-only pages require OCR first.', 'extract'),
+      route('pdf-docx', 'pdf', 'docx', 'PDF', 'DOCX', FORMATS.pdf.accept, 'Reconstructs real editable Word text, links and detected tables at the original page geometry; only genuine non-text artwork is retained as imagery. Designed pages use editable positioned text boxes while ordinary prose remains normal flowing paragraphs. Scan-only pages require OCR first.', 'reconstructed'),
       route('pdf-xlsx', 'pdf', 'xlsx', 'PDF', 'XLSX', FORMATS.pdf.accept, 'Reconstructs embedded PDF text and detected tables as native worksheet cells, one sheet per page. Scan-only pages require OCR first.', 'extract'),
     ],
   },
@@ -574,6 +598,11 @@ function preservationContractFor(conversion) {
 
   if (conversion.handler === 'universal') {
     Object.keys(dimensions).forEach((key) => { dimensions[key] = 'exact' })
+  } else if (conversion.source === 'docx' && conversion.target === 'pdf' && conversion.handler === 'docx-pdf') {
+    Object.assign(dimensions, {
+      content: 'visual', layout: 'visual', theme: 'visual', structure: 'flattened',
+      media: 'visual', metadata: 'preserved', color: 'visual', animation: 'flattened', resolution: 'preserved',
+    })
   } else if (conversion.source === 'pdf' && !conversion.engine) {
     if (conversion.target === 'txt') {
       Object.assign(dimensions, {

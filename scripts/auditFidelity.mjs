@@ -22,6 +22,7 @@ import { csvCell, csvRowsToRecords, detectCsvDelimiter, parseCsv } from '../src/
 import { semanticPdfPagesToDocx, semanticPdfPagesToXlsx, structuredRowsToXlsx } from '../src/lib/officeEngine.js'
 import { nativeTableToPdf, nativeTextToPdf } from '../src/lib/nativePdfWriter.js'
 import { annotationRectangle, pdfDestinationPageNumber, vectorTableGrids } from '../src/lib/pdfGeometry.js'
+import { repairPdfTextSpacing } from '../src/lib/pdfTextRepair.js'
 import { planPdfRasterPage } from '../src/lib/rasterPolicy.js'
 import { assertPsdFidelityLimits, flattenPsdLayers } from '../src/lib/psdPolicy.js'
 import { convertWithPandoc, safePandocMediaPath } from '../src/lib/pandocEngine.js'
@@ -66,6 +67,9 @@ const vectorGrid = vectorTableGrids({
 assert.equal(vectorGrid.length, 1, 'PDF vector table grid was not detected')
 assert.deepEqual(vectorGrid[0].columnWidths, [80, 120])
 assert.deepEqual(vectorGrid[0].rows.map((row) => row.map((cell) => cell.columnSpan)), [[1, 1], [1, 1], [1, 1]])
+assert.equal(repairPdfTextSpacing('2. Contr ibution Highlights'), '2. Contribution Highlights')
+assert.equal(repairPdfTextSpacing('3. Additional Wor k'), '3. Additional Work')
+assert.equal(repairPdfTextSpacing('Project management remains editable'), 'Project management remains editable')
 
 function xml(entries, name) {
   assert(entries[name], `Missing OOXML part: ${name}`)
@@ -100,6 +104,11 @@ for (const conversion of CONVERSIONS) {
 }
 assert.equal(CONVERSION_BY_ID['pdf-docx'].preservation.dimensions.layout, 'visual')
 assert.equal(CONVERSION_BY_ID['pdf-docx'].preservation.dimensions.structure, 'structured')
+assert.equal(CONVERSION_BY_ID['docx-pdf'].availability, 'ready')
+assert.equal(CONVERSION_BY_ID['docx-pdf'].handler, 'docx-pdf')
+assert.equal(CONVERSION_BY_ID['docx-pdf'].preservation.dimensions.layout, 'visual')
+assert.equal(CONVERSION_BY_ID['docx-pdf'].preservation.dimensions.metadata, 'preserved')
+assert.equal(CONVERSION_BY_ID['docx-pdf'].qualityGate.policyId, 'docx-pdf')
 assert.equal(CONVERSION_BY_ID['pdf-xlsx'].preservation.dimensions.structure, 'structured')
 assert.equal(CONVERSION_BY_ID['html-pdf'].preservation.dimensions.structure, 'structured')
 assert.equal(CONVERSION_BY_ID['html-pdf'].qualityGate.policyId, 'html')
@@ -111,6 +120,23 @@ assert.equal(CONVERSION_BY_ID['engine:imagemagick:GIF:gif->webp'].handler, 'imag
 assert.equal(CONVERSION_BY_ID['engine:imagemagick:JPEG:jpg->png'].handler, 'imagemagick')
 assert.equal(CONVERSION_BY_ID['engine:pandoc:html:html->docx'].handler, 'pandoc')
 assert.equal(CONVERSION_BY_ID['engine:pandoc:docx:docx->html'].handler, 'pandoc')
+
+// The Word fixture combines the editing and layout constructs most likely to
+// expose fidelity regressions in either conversion direction.
+const officeFixture = unzipSync(await readFile(join(fixtures, 'office-fidelity.docx')))
+const officeDocumentXml = xml(officeFixture, 'word/document.xml')
+assert.equal((officeDocumentXml.match(/<w:sectPr/g) || []).length, 3, 'Word fixture lost mixed sections')
+assert(officeDocumentXml.includes('<w:pgSz w:w="15840" w:h="12240" w:orient="landscape"'), 'Word fixture lost landscape page geometry')
+assert(officeDocumentXml.includes('<w:cols w:space="480" w:num="2" w:sep="true"'), 'Word fixture lost two-column layout')
+assert(officeDocumentXml.includes('<wp:anchor'), 'Word fixture lost floating artwork')
+assert((officeDocumentXml.match(/<w:tbl>/g) || []).length >= 5, 'Word fixture lost complex or nested tables')
+assert(officeDocumentXml.includes('<w:numPr>'), 'Word fixture lost real list numbering')
+assert(officeDocumentXml.includes('<w:hyperlink'), 'Word fixture lost its hyperlink')
+assert(officeDocumentXml.includes('<w:bookmarkStart'), 'Word fixture lost its bookmark')
+assert(officeDocumentXml.includes('<m:oMath>') && officeDocumentXml.includes('<m:f>'), 'Word fixture lost its native equation')
+assert(xml(officeFixture, 'word/footnotes.xml').includes('editable note content'), 'Word fixture lost its real footnote')
+assert.equal(Object.keys(officeFixture).filter((name) => /^word\/header\d+\.xml$/.test(name)).length, 3, 'Word fixture lost section headers')
+assert.equal(Object.keys(officeFixture).filter((name) => /^word\/footer\d+\.xml$/.test(name)).length, 3, 'Word fixture lost section footers')
 
 // A real layered PSD round-trip retains its composite pixels and the layer
 // properties used by the Word/Excel inventories.
@@ -184,6 +210,7 @@ const alphaItem = {
 const gammaItem = {
   id: 'gamma', text: 'Far column', x: 300, top: 52, width: 68, height: 14,
   baseline: 63, fontSize: 12, fontFamily: 'Arial', bold: false, italics: false, color: 'FFFFFF', backgroundColor: '1C170F', visible: true, dir: 'ltr', role: 'P', hasEOL: true,
+  link: 'https://example.com/editable-link',
 }
 const continuationItem = {
   id: 'continuation', text: 'continued in the same editable paragraph', x: 42, top: 67, width: 210, height: 14,
@@ -220,29 +247,73 @@ const nativePages = [{
     id: 'table-1', tagged: true, rows: [[tableCell]], bounds: { x: 42, top: 112, width: 90, height: 20 },
     itemIds: new Set(['beta']),
   }],
-  tableItemIds: new Set(['beta']), graphics: null, hasGraphics: false,
+  tableItemIds: new Set(['beta']),
+  graphics: { bytes: onePixelPng, bounds: { x: 0, top: 0, width: 612, height: 792 }, coverage: 1 },
+  hasGraphics: true,
+  hasRasterGraphics: false,
 }]
 const docxBytes = await semanticPdfPagesToDocx({ title: 'Fallback', pages: nativePages, metadata })
 await writeFile(join(fixtures, 'native-semantic.docx'), docxBytes)
 const docx = unzipSync(docxBytes)
 const documentXml = xml(docx, 'word/document.xml')
-assert.equal(Object.keys(docx).filter((name) => name.startsWith('word/media/')).length, 0, 'Text-only DOCX unexpectedly contains a page image')
+assert.equal(Object.keys(docx).filter((name) => name.startsWith('word/media/') && !name.endsWith('/')).length, 1, 'DOCX lost vector-only non-text artwork')
 assert(documentXml.includes('Alpha editable text'), 'DOCX lost native editable text')
 assert(documentXml.includes('Far column'), 'DOCX lost a separated same-baseline text segment')
 assert(documentXml.includes('continued in the same editable paragraph'), 'DOCX lost a wrapped source line')
 assert(!documentXml.includes('<w:framePr'), 'DOCX text was placed in absolute frames instead of editable flow')
-assert(
-  documentXml.split('</w:p>').some((paragraph) =>
-    paragraph.includes('Alpha editable text') && paragraph.includes('continued in the same editable paragraph')),
-  'DOCX did not merge source line wraps into one editable paragraph',
-)
+assert(documentXml.includes('<wps:wsp'), 'Designed PDF text was not retained in editable positioned Word text boxes')
 assert(documentXml.includes('<w:color w:val="D19C38"'), 'DOCX lost the source text colour')
 assert(documentXml.includes('<w:tbl>'), 'DOCX lost the native Word table')
-assert(!documentXml.includes('<w:tblpPr'), 'DOCX table was left as a floating layout object')
+assert(documentXml.includes('<w:tblpPr'), 'Designed PDF table lost its source page position')
 assert(documentXml.includes('w:name="pdf-page-1"'), 'DOCX lost its page bookmark')
 assert(documentXml.includes('w:anchor="pdf-page-1"'), 'DOCX lost an internal PDF link destination')
+assert(xml(docx, 'word/_rels/document.xml.rels').includes('https://example.com/editable-link'), 'DOCX lost an external PDF link')
 assert(documentXml.includes('w:w="12240"') && documentXml.includes('w:h="15840"'), 'Portrait DOCX page geometry changed')
 assert(xml(docx, 'docProps/core.xml').includes('Original author'), 'DOCX metadata was not retained')
+
+const flowAlpha = { ...alphaItem, hasEOL: true, destinationPageNumber: undefined }
+const flowPages = [{
+  pageNumber: 1, width: 612, height: 792, rotation: 0, language: 'en-US', tagged: true,
+  items: [flowAlpha, continuationItem],
+  lines: [
+    { id: 'flow-1', items: [flowAlpha], x: 42, top: 52, width: 108, height: 14, role: 'P', text: flowAlpha.text, segments: [{ items: [flowAlpha], x: 42, top: 52, width: 108, height: 14, role: 'P', text: flowAlpha.text }] },
+    { id: 'flow-2', items: [continuationItem], x: 42, top: 67, width: 210, height: 14, role: 'P', text: continuationItem.text, segments: [{ items: [continuationItem], x: 42, top: 67, width: 210, height: 14, role: 'P', text: continuationItem.text }] },
+  ],
+  tables: [], tableItemIds: new Set(), graphics: null, hasGraphics: false, hasRasterGraphics: false,
+}]
+const flowDocx = unzipSync(await semanticPdfPagesToDocx({ title: 'Flow', pages: flowPages, metadata }))
+const flowDocumentXml = xml(flowDocx, 'word/document.xml')
+assert(!flowDocumentXml.includes('<wps:wsp'), 'Ordinary prose was needlessly converted to positioned text boxes')
+assert(
+  flowDocumentXml.split('</w:p>').some((paragraph) =>
+    paragraph.includes('Alpha editable text') && paragraph.includes('continued in the same editable paragraph')),
+  'DOCX did not merge source line wraps into one editable flow paragraph',
+)
+
+const signatureItems = [
+  { ...continuationItem, id: 'signature-label', text: 'Signature:', x: 42, top: 640, width: 54, hasEOL: true },
+  { ...continuationItem, id: 'date-label', text: 'Date of signature:', x: 300, top: 640, width: 88, hasEOL: false },
+  { ...continuationItem, id: 'date-value', text: '09/08/2026', x: 460, top: 640, width: 64, hasEOL: false },
+]
+const signatureLine = {
+  id: 'signature-line', items: signatureItems, x: 42, top: 640, width: 482, height: 14, role: 'P',
+  text: 'Signature: Date of signature: 09/08/2026',
+  segments: signatureItems.map((item) => ({
+    items: [item], x: item.x, top: item.top, width: item.width, height: item.height,
+    fontSize: item.fontSize, role: 'P', text: item.text,
+  })),
+}
+const sparseArtworkPage = [{
+  pageNumber: 1, width: 612, height: 792, rotation: 0, language: 'en-US', tagged: false,
+  items: signatureItems, lines: [signatureLine], tables: [], tableItemIds: new Set(),
+  graphics: { bytes: onePixelPng, bounds: { x: 120, top: 160, width: 300, height: 220 }, coverage: 0.12 },
+  hasGraphics: true, hasRasterGraphics: true,
+}]
+const sparseArtworkDocx = unzipSync(await semanticPdfPagesToDocx({ title: 'Sparse artwork', pages: sparseArtworkPage, metadata }))
+const sparseArtworkXml = xml(sparseArtworkDocx, 'word/document.xml')
+assert(!sparseArtworkXml.includes('<wps:wsp'), 'Sparse report artwork forced ordinary editable text into outlined text boxes')
+assert.equal((sparseArtworkXml.match(/<w:tab\/>/g) || []).length, 2, 'Separated editable fields lost their native Word tab stops')
+assert.equal(Object.keys(sparseArtworkDocx).filter((name) => name.startsWith('word/media/') && !name.endsWith('/')).length, 1, 'Sparse artwork was not retained as one tightly bounded image')
 
 const xlsx = unzipSync(semanticPdfPagesToXlsx({ title: 'Fallback', pages: nativePages, metadata }))
 assert.equal(Object.keys(xlsx).filter((name) => name.startsWith('xl/media/')).length, 0, 'Native PDF workbook contains page screenshots')
@@ -519,8 +590,10 @@ console.log(JSON.stringify({
   routesWithContracts: CONVERSIONS.length,
   exactPreservation: { base64RoundTrip: true, zipRoundTrip: true, streamedBatchFiles: 50 },
   office: {
-    nativeDocxText: true, nativeDocxTable: true, editableFlowParagraphs: true, absoluteTextFrames: 0,
-    nativeXlsxCells: true, nativeXlsxStyling: true, pageScreenshots: 0, scanOnlyRefusal: true, metadata: true,
+    nativeDocxText: true, nativeDocxTable: true, editableFlowParagraphs: true,
+    positionedEditableTextBoxes: true, floatingPositionedTables: true, vectorArtworkLayer: true,
+    absoluteTextFrames: 0, nativeXlsxCells: true, nativeXlsxStyling: true,
+    pageScreenshots: 0, scanOnlyRefusal: true, metadata: true,
   },
   psd: { compositePixels: true, layerHierarchy: true, layerProperties: true, precisionGuard: true },
   data: {

@@ -462,8 +462,8 @@ async function convertPdf(file, target) {
       .catch(() => ({}))
     const semanticPages = await pdfToSemanticPages(doc, {
       includeGraphics: target === 'docx',
-      sampleBackgrounds: target === 'xlsx',
-      graphicsDpi: 180,
+      sampleBackgrounds: target === 'docx' || target === 'xlsx',
+      graphicsDpi: 288,
     })
     if (target === 'xlsx') {
       return output(semanticPdfPagesToXlsx({
@@ -556,6 +556,10 @@ export async function convertFile(file, conversion) {
   if (conversion.handler === 'pandoc') {
     const { convertWithPandoc } = await import('./pandocEngine.js')
     return convertWithPandoc(file, conversion)
+  }
+  if (conversion.handler === 'docx-pdf') {
+    const { docxToLibreOfficePdf } = await import('./libreOfficePdfEngine.js')
+    return output(await docxToLibreOfficePdf(file), file, 'pdf')
   }
   if (conversion.source === 'psd') return convertPsd(file, conversion.target)
   if (conversion.source === 'pdf') return convertPdf(file, conversion.target)
