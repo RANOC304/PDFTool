@@ -2,3 +2,15 @@ node_modules
 dist
 *.local
 .vercel
+/.env*
+/output/
+
+# Generated conversion audit artifacts
+/scripts/fixtures/browser-*/
+/scripts/fixtures/lo-profile*/
+/scripts/fixtures/fidelity.pdf
+/scripts/fixtures/office-fidelity.docx
+/scripts/fixtures/native-flow-render.png
+/scripts/fixtures/native-semantic.docx
+/scripts/fixtures/native-semantic.pdf
+/scripts/fixtures/native-semantic-render/

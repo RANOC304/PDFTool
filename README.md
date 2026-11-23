@@ -112,13 +112,16 @@ engine-required until an equivalent local runtime is bundled.
 
 ## Development
 
+Install Node.js 22.13 or later. The fidelity audit generates its own PDF and Word samples from the synthetic fixtures included here.
+
 ```sh
-npm install
+npm ci
 npm run dev      # dev server on http://localhost:5173
 npm run build    # production build in dist/
 npm run preview  # serve the production build locally
 npm run audit:conversions  # validate the full route graph and quality gates
 npm run audit:fidelity     # exercise document, data, PDF and image fixtures
+npm run audit:deployment   # verify the production assets and hosting headers
 ```
 
 ## Deploying to Vercel
@@ -162,4 +165,6 @@ headers are required for LibreOffice's WebAssembly threads; do not remove them.
 Note: pdf.js rendering uses `intent: 'print'` so thumbnails keep rendering
 when the tab is hidden or backgrounded — don't remove that flag.
 
-Made By Aubin
+## Contributing and license
+
+See the [contributor guide](CONTRIBUTING.md) for bug reports and pull requests. Massicot's original code is available under the [MIT License](LICENSE). [Third-party notices](THIRD_PARTY_NOTICES.md) cover external dependencies, runtimes, and fonts.

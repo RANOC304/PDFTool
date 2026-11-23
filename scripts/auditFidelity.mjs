@@ -374,8 +374,8 @@ assert.deepEqual(csvRecords, [
   { name: '', name_2: '', column_3: '' },
 ])
 assert.equal(csvCell({ nested: true }), '"{""nested"":true}"')
-assert.equal(detectCsvDelimiter('name;city;note\nAubin;Paris;"one; two"'), ';')
-assert.deepEqual(parseCsv('name;city\nAubin;Paris'), [['name', 'city'], ['Aubin', 'Paris']])
+assert.equal(detectCsvDelimiter('name;city;note\nSample;Paris;"one; two"'), ';')
+assert.deepEqual(parseCsv('name;city\nSample;Paris'), [['name', 'city'], ['Sample', 'Paris']])
 assert.throws(() => parseCsv('name\n"unfinished'), /not closed/)
 assert.throws(
   () => structuredRowsToXlsx([['value'], ['x'.repeat(32_768)]], { sheetName: 'Limit' }),
